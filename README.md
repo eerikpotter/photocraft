@@ -12,6 +12,9 @@ service requires no conventional application server, database or object-storage 
 
 **Local compute. Network-native state. Sovereign cloud.**
 
+**[Open PhotoCraft on ICP mainnet](https://reyqh-myaaa-aaaas-amyeq-cai.icp.net/)** —
+hosted on ICP's European subnet, with Internet Identity sign-in and personal cloud files.
+
 The first cloud milestone adds Internet Identity sign-in, explicit save/open, chunked
 `.pcraft` uploads, checksum verification and revisions that survive canister upgrades.
 Use **File → Save to Cloud…** and **File → Open from Cloud…** in the ICP build. The separate

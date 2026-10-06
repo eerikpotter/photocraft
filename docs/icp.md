@@ -88,24 +88,55 @@ in the genuine II window; no password or private key is sent to the PhotoCraft b
 
 ## Mainnet demonstration
 
-Use a funded, non-anonymous deployment identity stored in the CLI keyring or encrypted storage.
-The deployment/controller identity is separate from the browser user's Internet Identity.
-Choose your controller and backup/recovery plan before putting valuable documents in the service.
+Live application: **[PhotoCraft on ICP](https://reyqh-myaaa-aaaas-amyeq-cai.icp.net/)**.
+Deployed on 2026-10-07:
+
+- Frontend: `reyqh-myaaa-aaaas-amyeq-cai`
+- Cloud backend: `rn333-2qaaa-aaaas-amyfa-cai`
+- Both canisters have the verified NNS web principal as their sole controller.
+
+The deployment uses the NNS web account as controller, linked through a temporary Internet
+Identity delegation. Use a fresh CLI identity name for each session, stored in the default
+OS keyring. Sign in to the intended NNS account and verify its principal before deploying:
 
 ```sh
 icp identity list
-icp identity default
-icp identity principal
-icp cycles balance -n ic
-RUSTUP_TOOLCHAIN=1.95.0 ICP_CLI_PLUGIN_COMPUTE_LIMIT_SECS=300 icp deploy -e ic
-icp canister status cloud -e ic
-icp canister status frontend -e ic
+icp identity link web <session-name> --app nns.ic0.app
+icp identity principal --identity <session-name>
+icp cycles balance -n ic --identity <session-name>
 ```
+
+The CLI delegation acts as the NNS principal; it is not an additional controller. Expiring
+the delegation does not remove the NNS account's control. The user's PhotoCraft sign-in has
+a different, app-specific principal, even when the same Internet Identity is used.
+
+The selected European subnet is
+`bkfrj-6k62g-dycql-7h53p-atvkj-zg4to-gaogh-netha-ptybj-ntsgw-rqe`.
+It hosts both the frontend and cloud backend. For an initial deployment, fund the cycles
+ledger first and then create each canister with 2T cycles (4T total, plus ledger fees):
+Creation and installation costs are deducted from that allocation, so the resulting execution
+balances are lower than 2T each.
+
+```sh
+RUSTUP_TOOLCHAIN=1.95.0 ICP_CLI_PLUGIN_COMPUTE_LIMIT_SECS=300 icp deploy -e ic \
+  --identity <session-name> \
+  --controller <verified-nns-principal> \
+  --subnet bkfrj-6k62g-dycql-7h53p-atvkj-zg4to-gaogh-netha-ptybj-ntsgw-rqe \
+  --cycles 2t
+icp canister status -e ic --identity <session-name>
+python3 packaging/icp/verify.py --environment ic
+```
+
+Always pass the linked identity explicitly; do not change the CLI's global default.
+ICP-to-cycles conversion spends ICP and should use an explicitly approved amount. A funding
+allocation is not a recurring subscription, and the initial amount is not a lifetime budget.
 
 Use the certified `https://<frontend-canister-id>.icp.net` address printed by deployment.
 Commit the generated public ID mappings under `.icp/data/`; never commit identity keys or
 local `.icp/cache/`. Keep the application origin stable; a new canister/custom domain may
 change the user's app-specific principal unless II alternative origins are configured.
+Local test files do not migrate to mainnet automatically. Download a local `.pcraft` copy,
+open it in the mainnet app, and use **File → Save to Cloud…** to save it there.
 
 The service initially permits signed-in users to create owner-only files within the
 published quotas. The global 2 GiB document cap bounds this demo but can be exhausted by
@@ -116,6 +147,9 @@ billing and dedicated Cloud Engine deployment are not included in this milestone
 ### Upgrades and backup
 
 A normal deploy upgrades the Rust backend in place and preserves its stable structures.
+After linking a fresh NNS CLI session, use `icp deploy -e ic --no-create --identity <session-name>`
+for updates. `--no-create` prevents accidentally creating replacement canisters if the public
+ID mappings are missing. The recorded canister IDs keep existing data and the app origin stable.
 Never use `--mode reinstall` on `cloud` while retaining documents: reinstall clears storage.
 Take and download canister snapshots before risky upgrades, and keep user-exportable `.pcraft`
 backups. The versioned Candid contract is `icp/backend/cloud.did`; memory IDs are documented in
@@ -158,10 +192,13 @@ uses same-origin API requests; the II popup runs at its own origin. No handwritt
 or new UI framework is introduced. CPU work is currently single-threaded; adding shared-memory
 workers will require its own compatibility testing, especially alongside popup sign-in.
 
-The HTTP checker compares the served HTML/JS/Wasm to the local build, checks certificate
+The HTTP checker supports local and mainnet deployments. It compares the served HTML/JS/Wasm to the local build, checks certificate
 headers, compression, MIME/CSP/cache settings, missing-file responses, the configured cloud
 canister/root key and Internet Identity metadata. The HTTP gateway
 verifies certification; this byte check is not a separate cryptographic security audit.
+On mainnet it also requires the canonical IC root key, rather than accepting an arbitrary
+local-network trust key. Run its regression checks with
+`python3 -B -m unittest discover -s packaging/icp -p 'test_*.py'`.
 
 ## Validation record
 
@@ -215,10 +252,25 @@ Validated locally on 2026-10-06–07:
   pass with no browser errors. Signed-in rows and history interactions were verified with
   synthetic native widget fixtures; the browser session was signed out.
 
+Mainnet validation on 2026-10-07:
+
+- Both canisters are running with only the approved NNS account as controller. Certified
+  state reads through the official Rust agent independently confirmed both are on the
+  European `bkfrj` subnet, using the pinned IC root key.
+- The frontend's served HTML/JS/Wasm matches the tested build from `5b1763a`; the Wasm is
+  26,226,607 bytes. Certified delivery, cache/MIME/CSP settings, the backend ID, canonical
+  mainnet root key and Internet Identity metadata checks pass.
+- The browser renders the editor and cloud sign-in panel without console errors. An
+  authenticated CLI call returns the new account's empty file list. A complete browser
+  sign-in/save/reload/open cycle on mainnet remains an interactive account smoke test;
+  no synthetic files were added to the mainnet backend during deployment.
+- The deployment verifier also passes locally, and its four trust/mapping regression
+  tests are included in the ICP workflow.
+
 The earlier delivery proof of concept rendered with WebGPU and forced WebGL2, imported an
 image, painted and undid a stroke. PNG export reported success in the app, but automation did
-not capture the downloaded file. No mainnet deployment or dedicated Cloud Engine test has
-been performed. Treat this as an integration milestone; cross-device and mainnet validation remain outstanding.
+not capture the downloaded file. No dedicated Cloud Engine test has been performed.
+Treat this as an integration milestone; cross-device cloud validation remains outstanding.
 
 The cloud UX refinement keeps all user-facing records named **files**. The legacy Candid
 `Project` type and storage schema remain unchanged, preserving existing data and clients.
