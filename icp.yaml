@@ -1,0 +1,15 @@
+canisters:
+  - icp/backend
+  - name: frontend
+    recipe:
+      type: "@dfinity/static-site@v0.4.0"
+      configuration:
+        dir: dist/web
+        build:
+          - bash packaging/icp/build.sh
+
+networks:
+  - name: local
+    mode: managed
+    gateway:
+      port: 0

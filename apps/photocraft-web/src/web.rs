@@ -56,7 +56,18 @@ pub fn start() {
                         log::info!("photocraft-web: wgpu backend {:?}", rs.adapter.get_info().backend);
                         app.set_wgpu(rs);
                     }
-                    Ok(Box::new(WebShell { app, inbox }))
+                    #[cfg(feature = "icp-cloud")]
+                    let cloud = {
+                        let cloud = crate::cloud::Cloud::new(cc.egui_ctx.clone());
+                        cloud.install_commands(&mut app.services, &cc.egui_ctx);
+                        cloud
+                    };
+                    Ok(Box::new(WebShell {
+                        app,
+                        inbox,
+                        #[cfg(feature = "icp-cloud")]
+                        cloud,
+                    }))
                 }),
             )
             .await;
@@ -108,6 +119,8 @@ fn query() -> String {
 struct WebShell {
     app: PhotocraftApp,
     inbox: Inbox,
+    #[cfg(feature = "icp-cloud")]
+    cloud: crate::cloud::Cloud,
 }
 
 impl eframe::App for WebShell {
@@ -132,6 +145,8 @@ impl eframe::App for WebShell {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.app.ui(ui, frame);
+        #[cfg(feature = "icp-cloud")]
+        self.cloud.ui(ui.ctx(), &mut self.app);
     }
 }
 

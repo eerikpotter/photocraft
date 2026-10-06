@@ -19,6 +19,17 @@
 #[cfg(target_arch = "wasm32")]
 mod web;
 
+#[cfg(all(target_arch = "wasm32", feature = "icp-cloud"))]
+mod cloud;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "cloud/presentation.rs"]
+mod cloud_presentation;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "cloud/flow.rs"]
+mod cloud_flow;
+
 #[cfg(target_arch = "wasm32")]
 fn main() {
     web::start();

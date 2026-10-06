@@ -40,6 +40,8 @@ pub const TABLE: &[(&str, Class)] = &[
     ("psd", Class::Standalone),
     ("codecs", Class::Standalone),
     ("raw", Class::Standalone),
+    // Optional cloud transport types contain no editor or UI dependencies.
+    ("cloud-protocol", Class::Standalone),
     ("adobe-assets", Class::Standalone),
     // Pen tablet input (the one isolated `unsafe` helper: AppKit interop on macOS).
     ("tablet", Class::Standalone),
