@@ -91,6 +91,7 @@ pub mod puppet_ui;
 pub mod rasterize_prompt;
 pub mod retouch_ui;
 pub mod rulers;
+pub mod service_commands;
 pub mod shortcut_dispatch;
 pub mod shortcuts;
 mod sizing;
@@ -178,6 +179,8 @@ pub type OsEventsFn = Box<dyn FnMut() -> Vec<OsEvent>>;
 /// I/O dependencies.
 #[derive(Default)]
 pub struct Services {
+    /// Optional interactive commands supplied by the host (for example, remote file storage).
+    pub commands: Vec<service_commands::Command>,
     /// Decode a file's bytes into a document (PSD, PNG, JPEG, …).
     pub import: Option<ImportFn>,
     /// Encode a document for a file name (format chosen by extension).

@@ -84,6 +84,7 @@ pub fn native(automation: Option<photocraft_automation::AuthorizedWorkspace>) ->
         }) as photocraft_ui_egui::AutomationCommandFn
     });
     Services {
+        commands: Vec::new(),
         import: Some(Box::new(|name: &str, bytes: &[u8]| {
             crate::crash_guard::guard("Open", || photocraft_io::import(name, bytes).map(|r| (r.document, r.warnings)).map_err(|e| e.to_string()))
         })),
