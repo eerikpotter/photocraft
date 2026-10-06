@@ -8,3 +8,5 @@ target/
 /secrets
 /temp
 /book/output
+/.icp/cache/
+/.tools/
