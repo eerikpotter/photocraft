@@ -7,7 +7,7 @@ local creative tools with a sovereign cloud backend on the Internet Computer.**
 
 This independent fork builds on PhotoCraft by the ArtCraft team and community.
 Its Rust/Wasm editor runs on your device; ICP delivers the application and provides
-identity, persistent project storage and owner-controlled revision history. The cloud
+identity, persistent file storage and owner-controlled revision history. The cloud
 service requires no conventional application server, database or object-storage service.
 
 **Local compute. Network-native state. Sovereign cloud.**
@@ -15,7 +15,8 @@ service requires no conventional application server, database or object-storage 
 The first cloud milestone adds Internet Identity sign-in, explicit save/open, chunked
 `.pcraft` uploads, checksum verification and revisions that survive canister upgrades.
 Use **File → Save to Cloud…** and **File → Open from Cloud…** in the ICP build. The separate
-**Sovereign Cloud** manager handles sign-in, projects and revision history.
+**Sovereign Cloud** manager separates **My files** from **Save file**, with dated version history
+and upload progress.
 It is an early demonstration, not a claim of complete Photoshop parity or production
 readiness. Sharing, collaboration, agent permissions and dedicated Cloud Engine validation
 are future phases. Documents are access-controlled, not end-to-end encrypted.

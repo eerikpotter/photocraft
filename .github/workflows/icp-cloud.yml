@@ -22,6 +22,7 @@ jobs:
           key: cloud-host-menu
       - run: cargo test -p photocraft-ui-egui --lib service_commands --locked
       - run: cargo check -p photocraft --locked
+      - run: cargo test -p photocraft-web --locked
 
   cloud:
     runs-on: ubuntu-latest

@@ -53,7 +53,7 @@ def prepare(site):
     metadata.parent.mkdir(parents=True, exist_ok=True)
     metadata.write_text(json.dumps({
         "name": "PhotoCraft Sovereign Cloud",
-        "description": "Local creative tools with owner-controlled cloud projects on the Internet Computer.",
+        "description": "Local creative tools with owner-controlled cloud files on the Internet Computer.",
     }))
     headers += "\n/.well-known/ii-app-metadata\n  Content-Type: application/json\n  Access-Control-Allow-Origin: *\n"
     (site / "_headers").write_text(headers)

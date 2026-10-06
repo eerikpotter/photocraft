@@ -4759,6 +4759,7 @@ dependencies = [
  "candid",
  "eframe",
  "egui",
+ "egui_kittest",
  "hex",
  "ic-agent",
  "ic-auth-client",

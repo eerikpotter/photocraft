@@ -46,35 +46,46 @@ existing command system. A future agent API needs a deliberate authorization bou
 the cloud panel is not an agent interface.
 
 **File → Save to Cloud…** opens the save view for an unlinked document and saves a new
-revision for an already linked project. **File → Open from Cloud…** opens the project library.
-The separate Sovereign Cloud window owns sign-in, project management and revision history;
+revision for an already linked file. **File → Open from Cloud…** opens **My files**.
+The separate Sovereign Cloud window owns sign-in, file management and dated version history;
 ordinary File Save/Export stays local. Host requests are visible in menu inspection and
 explicitly reject automation until a capability model exists. They never replace built-in
 editor commands. The generic menu extension is kept in its own commit for upstream review.
+
+The cloud manager has a scoped blue/violet identity, a distinct **My files** library and a
+**Save file** view. The primary action saves a file or its changes; copying is a secondary
+**More…** action. Version history shows local date/time. Transfer progress and expiring activity
+notifications are separate from files; incomplete records appear only under **Unfinished saves**.
+Encoding captures the immutable document at click time and waits for a loading frame before
+running. Only the committed snapshot is marked saved; subsequent edits remain dirty.
+
+The public protocol still calls its single-file record `Project`. That internal name is kept
+for Candid and stable-memory compatibility; it is not a workspace or folder. Actual projects,
+folders and shared workspaces can be a future layer grouping these files.
 
 ## First cloud milestone
 
 Implemented behavior, subject to the validation record in [icp.md](icp.md):
 
 - Internet Identity sign-in with app-specific principals; no anonymous cloud storage.
-- Owner-only projects, explicit save/open, and a list of immutable revisions.
+- Owner-only files, explicit save/open, and a list of immutable revisions.
 - Standard `.pcraft` snapshots in 512 KiB chunks; SHA-256 checked before publication and
   after download. Backend manifests come from consensus update calls; chunk queries are
   verified against those manifests.
-- Expected-revision checks reject stale saves. Only one pending upload per project.
+- Expected-revision checks reject stale saves. Only one pending upload per file.
 - Repeated identical chunks and repeated commits are idempotent. The browser can retry a
   failed save while its snapshot remains in memory. After a page reload an unfinished
   upload can be discarded; automatic cross-reload upload resumption is future work.
 - A revision becomes visible only after every chunk passes the checksum. Uploading does
   not mark a document saved; the matching local snapshot is marked saved after commit.
   Edits made during upload stay dirty.
-- All project metadata, pending uploads, quotas and bytes use stable structures. No bulk
+- All file metadata, pending uploads, quotas and bytes use stable structures. No bulk
   heap serialization is required during upgrades. Memory IDs in `store.rs` are permanent
   schema assignments and must never be repurposed.
-- Owners can delete old revisions, discard pending uploads and remove empty projects.
+- Owners can delete old revisions, discard pending uploads and remove empty file records.
 
 Demo limits: 64 MiB per encoded document, 256 MiB per principal including versions and
-reserved uploads, 20 projects per principal, 20 revisions per project, 1,000 projects and
+reserved uploads, 20 files per principal, 20 versions per file, 1,000 files and
 2 GiB of document data across the service. These are explicit prototype bounds, not ICP
 protocol limits or a promise of production scale. Metadata and canister overhead add to
 document storage. Open registration can exhaust the shared demo quota; operators should
@@ -164,7 +175,7 @@ and the certified-assets recipe. Rust dependency licenses and upstream asset not
 in force. The fork removes ArtCraft logo assets and credits the original project in text.
 
 Model providers may be added for optional external AI capabilities. They must not become a
-hidden dependency for ordinary save/open, project ownership or editing.
+hidden dependency for ordinary save/open, file ownership or editing.
 
 Relevant primary references: [II protocol](https://github.com/dfinity/internet-identity/blob/main/docs/ii-spec.mdx),
 [stable structures](https://docs.internetcomputer.org/languages/rust/stable-structures/),

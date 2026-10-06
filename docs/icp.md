@@ -1,8 +1,8 @@
 # PhotoCraft on ICP
 
 The optional cloud build runs the same Rust editor in the browser and adds Internet Identity,
-owner-only cloud projects and revision storage. A certified static-site canister serves the
-application; a separate Rust canister stores project manifests and chunked `.pcraft` files.
+owner-only cloud files and revision storage. A certified static-site canister serves the
+application; a separate Rust canister stores file manifests and chunked `.pcraft` files.
 See [ICP Cloud Architecture](ICP_CLOUD_ARCHITECTURE.md) for the thesis, boundaries and roadmap.
 
 ## Prerequisites
@@ -61,17 +61,21 @@ ICP_CLI_PLUGIN_COMPUTE_LIMIT_SECS=300 icp sync frontend -e local
 
 1. Open/create a document using the normal editor.
 2. Choose **File → Save to Cloud…**, or open **Sovereign Cloud** (the ICP infinity-logo
-   button at the top right). Sign in with Internet Identity; the panel should say
-   **Signed in with Internet Identity**.
-3. In **Save document**, enter a project name and select **Save to Cloud**. Wait for the
-   saved-revision confirmation. **Save as New Project…** makes an independent copy of a
-   linked document.
-4. Edit and choose **File → Save to Cloud…** again to save another revision of the linked project.
-5. Reload, sign in if necessary, and choose **File → Open from Cloud…**. In **Cloud projects**,
-   select **Open latest**, or expand **Revision history** to open an older version.
+   button at the top right). Sign in with Internet Identity; **Account** contains your identity.
+3. In **Save file**, enter a file name and select **Save file**. The loader appears before
+   encoding, followed by upload progress and **Finishing save…**. Wait for the dated **Saved**
+   activity confirmation. A linked file has one primary action, **Save changes**; **More… →
+   Save a copy…** reveals a separate naming flow for an independent copy.
+4. Edit and choose **File → Save to Cloud…** again to save another version of the linked file.
+5. Reload, sign in if necessary, and choose **File → Open from Cloud…**. **My files** lists
+   completed saves; select **Open file**, or expand **Version history** for earlier versions.
+   File and version timestamps use your device's local timezone. Activity messages are
+   dismissible and expire after eight seconds; errors stay visible until dismissed.
 6. Use a second browser/device at the same application origin and sign in to the same II account.
-7. Test interrupted saves: the previous revision remains available; **Retry this save** resumes
-   the in-memory snapshot. After reloading, discard the unfinished upload before saving anew.
+7. Test interrupted saves: the previous version remains available; **Retry save** in **Save
+   file** resumes the captured in-memory snapshot. **Dismiss attempt** lets you save current
+   edits instead. In **My files → Unfinished saves**, discard interrupted uploads before
+   saving anew. Unfinished saves are not openable files.
 
 Ordinary File Save/Export remains a local download. Cloud saves are explicit. Browser recovery
 and automatic saving are future work; do not close unsaved work. The panel explains current
@@ -99,7 +103,7 @@ Commit the generated public ID mappings under `.icp/data/`; never commit identit
 local `.icp/cache/`. Keep the application origin stable; a new canister/custom domain may
 change the user's app-specific principal unless II alternative origins are configured.
 
-The service initially permits signed-in users to create owner-only projects within the
+The service initially permits signed-in users to create owner-only files within the
 published quotas. The global 2 GiB document cap bounds this demo but can be exhausted by
 registrations. Choose admission controls and funding policy before advertising a public service.
 Monitor canister cycles and maintain a backup controller. Document encryption, sharing,
@@ -167,10 +171,10 @@ Validated locally on 2026-10-06–07:
   layers passed. Upstream's job tests passed (11 passed; one opt-in timing test ignored).
 - Both canisters deployed to the managed local network. Certified asset byte/header checks,
   runtime environment and II metadata checks passed; the cloud panel rendered in the browser.
-- The user reported successful Internet Identity sign-in. End-to-end browser save/reload/open
-  is **not yet verified**. The automated browser initially did not expose the II popup;
-  complete the demonstration above in a regular browser. The panel supports reopening the
-  sign-in window without reloading the document.
+- The user confirmed Internet Identity sign-in and core browser cloud saving/loading work.
+  This is an interactive user report, not an automated cross-device or reload test. The
+  automated browser initially did not expose the II popup; the panel supports reopening
+  sign-in without reloading the document.
 - The File-menu follow-up passed 498 shared UI tests (three opt-in tests ignored), including
   command ordering, absent-document/disabled guards and rejection of automation requests.
   The native editor still builds with no cloud commands registered. All 21 Wasm-safe crates
@@ -180,9 +184,24 @@ Validated locally on 2026-10-06–07:
 - Visually verified the ICP logo, File-menu placement, disabled Save to Cloud without a
   document, enabled Save to Cloud after creating one, and both menu routes opening the cloud
   manager. The updated build's certified asset and runtime-configuration checks pass. The
-  authenticated save/project views still require the interactive account test above.
+  signed-in controls are additionally exercised with synthetic data in shared-widget tests.
+- Four cloud presentation tests pass: file extensions, the secondary copy flow, blocked
+  saves while busy/invalid, and file/progress layouts across all five themes at two widths.
+  Twenty offscreen PNGs were rendered; dark and light layouts were visually inspected.
+  These test the actual browser widgets without bypassing Internet Identity. Strict native
+  adapter and Wasm clippy, the ordinary web check and all 27 layer checks pass.
+- The refined frontend was deployed to the existing PocketIC network and visually checked in
+  a fresh browser tab. Certified assets/runtime configuration/II metadata pass; browser
+  error logs are empty. Authenticated save/copy/retry on this exact build still needs the
+  interactive account smoke test above.
 
 The earlier delivery proof of concept rendered with WebGPU and forced WebGL2, imported an
 image, painted and undid a stroke. PNG export reported success in the app, but automation did
 not capture the downloaded file. No mainnet deployment or dedicated Cloud Engine test has
-been performed. Treat this as an integration milestone pending the interactive sign-in test.
+been performed. Treat this as an integration milestone; cross-device and mainnet validation remain outstanding.
+
+The cloud UX refinement keeps all user-facing records named **files**. The legacy Candid
+`Project` type and storage schema remain unchanged, preserving existing data and clients.
+The optional browser adapter owns the blue/violet styling; native editor themes are unchanged.
+CPU encoding still runs synchronously after the initial loading frame; large files can pause
+spinner animation during encoding. A worker implementation remains future work.
