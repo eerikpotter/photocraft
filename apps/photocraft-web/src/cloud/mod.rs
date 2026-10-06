@@ -1,5 +1,6 @@
 //! Optional browser/cloud adapter. No changes to the upstream engine or document format.
 mod api;
+mod panel;
 use api::{Api, args};
 use candid::Principal;
 use ic_auth_client::{AuthClient, AuthClientLoginOptions};
@@ -25,6 +26,8 @@ struct Attempt {
     doc_revision: u64,
 }
 enum Event {
+    RequestSave,
+    RequestProjects,
     Initialized,
     SignedIn,
     SignedOut,
@@ -36,11 +39,17 @@ enum Event {
     Opened(Project, Revision, Vec<u8>),
     Removed,
 }
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Save,
+    Projects,
+}
 pub struct Cloud {
     auth: Rc<RefCell<Option<AuthClient>>>,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
     visible: bool,
+    view: View,
     busy: bool,
     signing_in: bool,
     status: String,
@@ -74,7 +83,8 @@ impl Cloud {
             auth,
             tx,
             rx,
-            visible: true,
+            visible: false,
+            view: View::Save,
             busy: false,
             signing_in: false,
             status: "Preparing cloud sign-in…".into(),
@@ -83,6 +93,26 @@ impl Cloud {
             bindings: BTreeMap::new(),
             attempt: None,
             delete: None,
+        }
+    }
+    pub fn install_commands(&self, services: &mut photocraft_ui_egui::Services, ctx: &egui::Context) {
+        for (id, label, after, save) in
+            [("host.cloud.save", "Save to Cloud…", "file.saveAs", true), ("host.cloud.projects", "Open from Cloud…", "host.cloud.save", false)]
+        {
+            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+            services.commands.push(photocraft_ui_egui::service_commands::Command {
+                id,
+                label,
+                path: &["File"],
+                after,
+                requires_document: save,
+                enabled: true,
+                request: Box::new(move || {
+                    tx.send(if save { Event::RequestSave } else { Event::RequestProjects }).map_err(|_| "Cloud service is unavailable".to_string())?;
+                    ctx.request_repaint();
+                    Ok(())
+                }),
+            });
         }
     }
     fn principal(&self) -> Option<Principal> {
@@ -288,6 +318,27 @@ impl Cloud {
     fn poll(&mut self, app: &mut PhotocraftApp, ctx: &egui::Context) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                Event::RequestSave => {
+                    self.visible = true;
+                    self.view = View::Save;
+                    if !self.busy && self.attempt.is_none() {
+                        let linked =
+                            app.session.active().and_then(|d| self.bindings.get(&d.doc.id.0)).is_some_and(|(owner, _, _)| Some(*owner) == self.principal());
+                        if linked {
+                            self.save(app, ctx, false);
+                        } else if let Some(doc) = app.session.active() {
+                            self.name = doc.doc.name.clone();
+                            self.status = "Choose a project name, then Save to Cloud.".into();
+                        }
+                    }
+                }
+                Event::RequestProjects => {
+                    self.visible = true;
+                    self.view = View::Projects;
+                    if !self.busy && self.principal().is_some() {
+                        self.refresh(ctx);
+                    }
+                }
                 Event::Initialized | Event::SignedIn => {
                     self.busy = false;
                     self.signing_in = false;
@@ -348,100 +399,6 @@ impl Cloud {
                     self.refresh(ctx);
                 }
             }
-        }
-    }
-    pub fn ui(&mut self, ctx: &egui::Context, app: &mut PhotocraftApp) {
-        self.poll(app, ctx);
-        egui::Area::new(egui::Id::new("photocraft.cloud.launcher")).anchor(egui::Align2::RIGHT_TOP, [-18.0, 36.0]).order(egui::Order::Foreground).show(
-            ctx,
-            |ui| {
-                let logo = egui::Image::new(egui::include_image!("../../assets/icp/logo.svg")).fit_to_exact_size(egui::vec2(28.0, 16.0));
-                if ui
-                    .add(egui::Button::image_and_text(logo, "Sovereign Cloud · Save / Open"))
-                    .on_hover_text("Save and open ICP cloud projects. File → Save downloads a local copy.")
-                    .clicked()
-                {
-                    self.visible = !self.visible;
-                }
-            },
-        );
-        let mut visible = self.visible;
-        egui::Window::new("PhotoCraft · Sovereign Cloud").id(egui::Id::new("photocraft.cloud.window")).open(&mut visible).default_width(340.0).default_pos([700.0,80.0]).show(ctx, |ui| {
-            ui.label("Local compute. Network-native state.");
-            ui.separator();
-            if let Some(principal) = self.principal() {
-                ui.label("Signed in with Internet Identity");
-                ui.small(principal.to_text());
-                ui.add_enabled_ui(!self.busy, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("Refresh projects").clicked() { self.refresh(ctx); }
-                        if ui.button("Sign out").clicked() {
-                            let auth = self.auth.borrow().clone();
-                            let (tx, ctx) = (self.tx.clone(), ctx.clone());
-                            self.busy = true;
-                            wasm_bindgen_futures::spawn_local(async move { if let Some(a) = auth { a.logout(None).await; } send(&tx, &ctx, Event::SignedOut); });
-                        }
-                    });
-                    ui.separator();
-                    ui.label("Save the active document to your ICP account");
-                    ui.label("Project name"); ui.text_edit_singleline(&mut self.name);
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(app.session.active().is_some() && self.attempt.is_none(), egui::Button::new("Save to sovereign cloud")).clicked() { self.save(app, ctx, false); }
-                        if ui.add_enabled(app.session.active().is_some() && self.attempt.is_none(), egui::Button::new("Save as new")).clicked() { self.save(app, ctx, true); }
-                    });
-                    if app.session.active().is_none() { ui.small("Create or open a document to enable cloud saving."); }
-                    ui.small("File → Save / Export downloads to this device. Use the button above to save to cloud.");
-                    if let Some(a) = self.attempt.clone() {
-                        if ui.button("Retry this save").clicked() { self.run_save(a, ctx); }
-                        if ui.button("Forget failed save (keeps document)").clicked() { self.attempt = None; self.refresh(ctx); }
-                    }
-                    egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
-                        for p in self.projects.clone() {
-                            ui.push_id(p.id, |ui| {
-                                ui.separator(); ui.strong(&p.name);
-                                if let Some(r) = p.revisions.last() && ui.button("Open latest").clicked() { self.open(p.clone(), r.clone(), ctx); }
-                                for r in p.revisions.iter().rev() {
-                                    ui.horizontal(|ui| {
-                                        if ui.button(format!("Open revision {}", r.id)).clicked() { self.open(p.clone(), r.clone(), ctx); }
-                                        ui.small(format!("{} KiB", r.bytes.div_ceil(1024)));
-                                        if ui.small_button("Delete").clicked() { self.delete = Some((r.id, "delete_revision_or_upload".into())); }
-                                    });
-                                }
-                                if let Some(id) = p.pending_upload && ui.button("Discard unfinished upload").clicked() { self.delete = Some((id, "delete_revision_or_upload".into())); }
-                                if p.revisions.is_empty() && p.pending_upload.is_none() && ui.button("Delete empty project").clicked() { self.delete = Some((p.id, "delete_project".into())); }
-                            });
-                        }
-                    });
-                });
-            } else {
-                ui.label("Sign in to save projects and open them on another device.");
-                let label = if self.signing_in { "Reopen Internet Identity" } else { "Sign in with Internet Identity" };
-                if ui.add_enabled((!self.busy || self.signing_in) && self.auth.borrow().is_some(), egui::Button::new(label)).clicked() { self.login(ctx); }
-                if self.signing_in { ui.small("No window? Allow this site's sign-in popup, or open the app in your regular browser."); }
-            }
-            ui.separator();
-            if self.busy { ui.spinner(); ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
-            ui.label(&self.status);
-            ui.collapsing("Architecture and demo limits", |ui| {
-                ui.label("The editor runs on this device. ICP delivers the app and stores owner-only project revisions. No conventional application server or object store is used.");
-                ui.label("Save is explicit. Refreshing before a successful save can lose changes. Downloads and local editing remain available without sign-in.");
-                ui.label("64 MiB per document; 256 MiB per account including versions; 20 projects and 20 revisions per project. Total service storage is capped at 2 GiB.");
-                ui.label("Documents are access-controlled, not end-to-end encrypted. The service controller can upgrade the backend. Sharing, collaboration and agent authorization are future phases.");
-                ui.hyperlink_to("Source and architecture", "https://github.com/eerikpotter/photocraft/blob/main/docs/ICP_CLOUD_ARCHITECTURE.md");
-            });
-        });
-        self.visible = visible;
-        if let Some((id, method)) = self.delete.clone() {
-            egui::Window::new("Delete cloud data?").collapsible(false).show(ctx, |ui| {
-                ui.label("This permanently removes the selected cloud item. Open local documents are unaffected.");
-                if ui.button("Delete permanently").clicked() {
-                    self.delete = None;
-                    self.remove(id, if method == "delete_project" { "delete_project" } else { "delete_revision_or_upload" }, ctx);
-                }
-                if ui.button("Cancel").clicked() {
-                    self.delete = None;
-                }
-            });
         }
     }
 }

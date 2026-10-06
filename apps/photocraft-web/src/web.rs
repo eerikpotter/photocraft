@@ -56,11 +56,17 @@ pub fn start() {
                         log::info!("photocraft-web: wgpu backend {:?}", rs.adapter.get_info().backend);
                         app.set_wgpu(rs);
                     }
+                    #[cfg(feature = "icp-cloud")]
+                    let cloud = {
+                        let cloud = crate::cloud::Cloud::new(cc.egui_ctx.clone());
+                        cloud.install_commands(&mut app.services, &cc.egui_ctx);
+                        cloud
+                    };
                     Ok(Box::new(WebShell {
                         app,
                         inbox,
                         #[cfg(feature = "icp-cloud")]
-                        cloud: crate::cloud::Cloud::new(cc.egui_ctx.clone()),
+                        cloud,
                     }))
                 }),
             )

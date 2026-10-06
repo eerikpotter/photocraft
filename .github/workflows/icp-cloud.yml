@@ -8,6 +8,21 @@ permissions:
   contents: read
 
 jobs:
+  host-menu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native UI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev libgtk-3-dev
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cloud-host-menu
+      - run: cargo test -p photocraft-ui-egui --lib service_commands --locked
+      - run: cargo check -p photocraft --locked
+
   cloud:
     runs-on: ubuntu-latest
     steps:

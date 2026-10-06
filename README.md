@@ -14,6 +14,8 @@ service requires no conventional application server, database or object-storage 
 
 The first cloud milestone adds Internet Identity sign-in, explicit save/open, chunked
 `.pcraft` uploads, checksum verification and revisions that survive canister upgrades.
+Use **File → Save to Cloud…** and **File → Open from Cloud…** in the ICP build. The separate
+**Sovereign Cloud** manager handles sign-in, projects and revision history.
 It is an early demonstration, not a claim of complete Photoshop parity or production
 readiness. Sharing, collaboration, agent permissions and dedicated Cloud Engine validation
 are future phases. Documents are access-controlled, not end-to-end encrypted.

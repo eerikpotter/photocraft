@@ -60,12 +60,15 @@ ICP_CLI_PLUGIN_COMPUTE_LIMIT_SECS=300 icp sync frontend -e local
 ### Browser demonstration
 
 1. Open/create a document using the normal editor.
-2. Open **Sovereign Cloud · Save / Open** (the ICP infinity-logo button at the top right)
-   and sign in with Internet Identity. The panel should say **Signed in with Internet Identity**.
-3. Enter a project name and select **Save to sovereign cloud**. Wait for the committed-revision
-   confirmation. **Save as new** creates an independent cloud project from the active document.
-4. Edit and save again to create another revision.
-5. Reload, sign in if necessary, and use **Open latest** or choose an earlier revision.
+2. Choose **File → Save to Cloud…**, or open **Sovereign Cloud** (the ICP infinity-logo
+   button at the top right). Sign in with Internet Identity; the panel should say
+   **Signed in with Internet Identity**.
+3. In **Save document**, enter a project name and select **Save to Cloud**. Wait for the
+   saved-revision confirmation. **Save as New Project…** makes an independent copy of a
+   linked document.
+4. Edit and choose **File → Save to Cloud…** again to save another revision of the linked project.
+5. Reload, sign in if necessary, and choose **File → Open from Cloud…**. In **Cloud projects**,
+   select **Open latest**, or expand **Revision history** to open an older version.
 6. Use a second browser/device at the same application origin and sign in to the same II account.
 7. Test interrupted saves: the previous revision remains available; **Retry this save** resumes
    the in-memory snapshot. After reloading, discard the unfinished upload before saving anew.
@@ -154,7 +157,7 @@ verifies certification; this byte check is not a separate cryptographic security
 
 ## Validation record
 
-Validated locally on 2026-10-06:
+Validated locally on 2026-10-06–07:
 
 - Five backend unit/contract tests passed.
 - Two PocketIC integration tests passed: ownership, interrupted upload, exact-byte retrieval
@@ -164,9 +167,20 @@ Validated locally on 2026-10-06:
   layers passed. Upstream's job tests passed (11 passed; one opt-in timing test ignored).
 - Both canisters deployed to the managed local network. Certified asset byte/header checks,
   runtime environment and II metadata checks passed; the cloud panel rendered in the browser.
-- Real Internet Identity sign-in and browser save/reload/open are **not yet verified**. The
-  embedded browser did not expose the II popup; complete the demonstration above in a regular
-  browser. The panel supports reopening the sign-in window without reloading the document.
+- The user reported successful Internet Identity sign-in. End-to-end browser save/reload/open
+  is **not yet verified**. The automated browser initially did not expose the II popup;
+  complete the demonstration above in a regular browser. The panel supports reopening the
+  sign-in window without reloading the document.
+- The File-menu follow-up passed 498 shared UI tests (three opt-in tests ignored), including
+  command ordering, absent-document/disabled guards and rejection of automation requests.
+  The native editor still builds with no cloud commands registered. All 21 Wasm-safe crates
+  and 27 dependency-layer checks pass. The cloud adapter passes strict clippy. Full native UI
+  clippy reports three pre-existing `collapsible_match` style warnings in unchanged upstream
+  `analysis_ui.rs`/`canvas.rs`; it passes when only that lint is excluded.
+- Visually verified the ICP logo, File-menu placement, disabled Save to Cloud without a
+  document, enabled Save to Cloud after creating one, and both menu routes opening the cloud
+  manager. The updated build's certified asset and runtime-configuration checks pass. The
+  authenticated save/project views still require the interactive account test above.
 
 The earlier delivery proof of concept rendered with WebGPU and forced WebGL2, imported an
 image, painted and undid a stroke. PNG export reported success in the app, but automation did

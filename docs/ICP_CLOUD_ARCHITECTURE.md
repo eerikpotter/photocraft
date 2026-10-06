@@ -34,6 +34,9 @@ Implementation boundaries:
 - `icp/backend`: independent Rust canister workspace; durable state and access checks.
 - `icp/protocol`: versioned Candid data types; independent of the editor document model.
 - `apps/photocraft-web/src/cloud`: optional `icp-cloud` platform adapter and cloud panel.
+- `crates/ui-egui/src/service_commands.rs`: provider-neutral host menu requests, empty by
+  default. File-menu entries queue requests into the browser adapter; no ICP types or clients
+  enter the shared editor. Native builds register no host commands.
 - `packaging/icp`, `icp.yaml`: ICP build, certified delivery and deployment.
 - Upstream `crates/*`: editing, rendering, codecs, UI and the ordinary `.pcraft` format.
 
@@ -41,6 +44,13 @@ Cloud operations are browser platform services, like file dialogs and downloads.
 not add identity or networking dependencies to the engine. Document edits still use the
 existing command system. A future agent API needs a deliberate authorization boundary;
 the cloud panel is not an agent interface.
+
+**File → Save to Cloud…** opens the save view for an unlinked document and saves a new
+revision for an already linked project. **File → Open from Cloud…** opens the project library.
+The separate Sovereign Cloud window owns sign-in, project management and revision history;
+ordinary File Save/Export stays local. Host requests are visible in menu inspection and
+explicitly reject automation until a capability model exists. They never replace built-in
+editor commands. The generic menu extension is kept in its own commit for upstream review.
 
 ## First cloud milestone
 
@@ -141,7 +151,8 @@ its improvements continuously and validate complete workflows against representa
 
 The hosting baseline was committed separately before merging upstream's background-job
 commits through `909efc0f6df0a684d270019384e355c850642e42`. The integration requires only
-small feature-gated hooks in the web entry point; the cloud service has its own lockfile.
+small feature-gated hooks in the web entry point and an optional generic UI service extension;
+the cloud service has its own lockfile.
 Internal API changes can still require adaptation. Maintaining a fork is not conflict-free.
 
 ## External dependencies and portability
