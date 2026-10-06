@@ -58,8 +58,17 @@ only from the File menu. **Save to Cloud…** asks for a name once, then uploads
 shows progress and files, with no second save button. Repeating Save to Cloud at the same local
 document revision does not create another version. The cloud snapshot revision is tracked
 separately from ordinary local downloads, so a local save cannot suppress a needed cloud save.
+The launcher centers vertically in the editor's measured options bar, following its theme
+and size without modifying upstream toolbar code. Hiding that bar also hides the launcher;
+the File menu remains the entry point when the toolbar is hidden.
 
-Version history shows local date/time. Transfer progress and expiring activity notifications
+Each file occupies one bordered row with its name, latest local save date/time and **Open file**.
+Clicking the name/date area expands dated version history; opening a file is a separate action.
+Long names truncate with the full name available on hover. Expansion follows the file ID through
+refreshes and reordering. The wider, resizable cloud window owns the only scrollbar, so the list
+and expanded history use its available space without a nested, fixed-height viewport.
+
+Transfer progress and expiring activity notifications
 are separate from files; incomplete records appear only under **Unfinished saves**. Encoding
 captures the immutable document at click time and waits for a loading frame before running.
 Only the committed snapshot is marked saved; subsequent edits remain dirty.

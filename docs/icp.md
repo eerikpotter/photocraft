@@ -70,7 +70,9 @@ ICP_CLI_PLUGIN_COMPUTE_LIMIT_SECS=300 icp sync frontend -e local
    **File → Save a Copy to Cloud…** to name an independent copy. The Sovereign Cloud launcher
    opens file management; it has no general save button or save tab.
 5. Reload, sign in if necessary, and choose **File → Open from Cloud…**. **My files** lists
-   completed saves; select **Open file**, or expand **Version history** for earlier versions.
+   completed saves in compact rows with a name, latest save date/time and **Open file**.
+   Click the name/date area to expand version history; **Open file** opens the latest version
+   directly. The resizable cloud window scrolls when needed, without a second nested file list.
    File and version timestamps use your device's local timezone. Activity messages are
    dismissible and expire after eight seconds; errors stay visible until dismissed.
 6. Use a second browser/device at the same application origin and sign in to the same II account.
@@ -191,10 +193,13 @@ Validated locally on 2026-10-06–07:
   document, enabled Save to Cloud after creating one, and both menu routes opening the cloud
   manager. The updated build's certified asset and runtime-configuration checks pass. The
   signed-in controls are additionally exercised with synthetic data in shared-widget tests.
-- Five cloud flow/presentation tests pass: unchanged-save routing, first-save/copy naming,
-  file extensions, blocked saves while busy/invalid, and file/progress layouts across all
-  five themes at two widths.
-  Twenty offscreen PNGs were rendered; dark and light layouts were visually inspected.
+- Eight cloud flow/presentation tests pass: unchanged-save routing, first-save/copy naming,
+  file extensions, blocked saves while busy/invalid, mouse/keyboard row expansion, independent
+  Open buttons, stable expansion after sorting, and file/progress layouts across all five
+  themes at 420 px and 760 px widths. Launcher alignment is checked against the measured
+  options bar across all themes, including changes to row height and hiding the toolbar.
+  Thirty-five offscreen PNGs were rendered, including expanded history and launcher alignment; dark and light layouts
+  were visually inspected for alignment, separation and long-name truncation.
   These test the actual browser widgets without bypassing Internet Identity. Strict native
   adapter and Wasm clippy, the ordinary web check and all 27 layer checks pass.
 - The refined frontend was deployed to the existing PocketIC network and visually checked in
@@ -205,6 +210,10 @@ Validated locally on 2026-10-06–07:
   without a document, enabled with a synthetic document, and the copy route opens the cloud
   sign-in flow. Certified served assets/configuration pass; no browser errors. The duplicate
   save controls are absent from the shared file/progress layouts.
+- The compact-file-list build is deployed locally. A fresh browser tab confirmed the larger
+  window, resizing and scrolling to overflow content; certified assets and runtime checks
+  pass with no browser errors. Signed-in rows and history interactions were verified with
+  synthetic native widget fixtures; the browser session was signed out.
 
 The earlier delivery proof of concept rendered with WebGPU and forced WebGL2, imported an
 image, painted and undid a stroke. PNG export reported success in the app, but automation did

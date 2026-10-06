@@ -5,6 +5,28 @@ pub fn palette(ctx: &egui::Context) -> Tokens {
     Tokens::for_kind(if Tokens::get(ctx).dark() { ThemeKind::Studio } else { ThemeKind::StudioLight })
 }
 
+/// Follow the editor's measured options bar instead of duplicating its theme-specific heights.
+pub fn launcher(ctx: &egui::Context, options_visible: bool) -> bool {
+    if !options_visible {
+        return false;
+    }
+    let Some(panel) = egui::containers::panel::PanelState::load(ctx, egui::Id::new("options_bar")) else {
+        return false;
+    };
+    let row = panel.outer_rect;
+    egui::Area::new(egui::Id::new("photocraft.cloud.launcher"))
+        .pivot(egui::Align2::RIGHT_CENTER)
+        .fixed_pos(egui::pos2(row.right() - 18.0, row.center().y))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            let logo = egui::Image::new(egui::include_image!("../../assets/icp/logo.svg")).fit_to_exact_size(egui::vec2(28.0, 16.0));
+            ui.add(egui::Button::image_and_text(logo, "Sovereign Cloud").wrap_mode(egui::TextWrapMode::Extend))
+                .on_hover_text("Your cloud files and version history. Also available from the File menu.")
+                .clicked()
+        })
+        .inner
+}
+
 /// Scope the cloud's visual identity to this UI. The editor's theme is untouched.
 pub fn style(ui: &mut egui::Ui) {
     let t = palette(ui.ctx());
@@ -153,12 +175,84 @@ pub fn revision_row(ui: &mut egui::Ui, timestamp: &str, bytes: u64, latest: bool
     action
 }
 
-pub fn file_summary(ui: &mut egui::Ui, name: &str, timestamp: &str, bytes: u64) -> bool {
-    ui.strong(file_name(name));
-    ui.horizontal_wrapped(|ui| {
-        ui.weak(format!("Saved {timestamp} · {}", size_label(bytes)));
-    });
-    ui.button("Open file").clicked()
+const FILE_ROW_HEIGHT: f32 = 44.0;
+const FILE_DATE_WIDTH: f32 = 150.0;
+const FILE_OPEN_WIDTH: f32 = 82.0;
+
+fn file_columns(rect: egui::Rect) -> (egui::Rect, egui::Rect, egui::Rect) {
+    let open = egui::Rect::from_min_max(
+        egui::pos2((rect.right() - FILE_OPEN_WIDTH - 8.0).max(rect.left()), rect.top() + 7.0),
+        egui::pos2(rect.right() - 8.0, rect.bottom() - 7.0),
+    );
+    let date = egui::Rect::from_min_max(
+        egui::pos2((open.left() - 10.0 - FILE_DATE_WIDTH).max(rect.left() + 32.0), rect.top()),
+        egui::pos2(open.left() - 10.0, rect.bottom()),
+    );
+    let name = egui::Rect::from_min_max(egui::pos2(rect.left() + 32.0, rect.top()), egui::pos2((date.left() - 10.0).max(rect.left() + 32.0), rect.bottom()));
+    (name, date, open)
+}
+
+pub fn file_column_labels(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+    let (name, date, _) = file_columns(rect);
+    file_cell(ui, name, egui::RichText::new("Name").small().weak());
+    file_cell(ui, date, egui::RichText::new("Last saved").small().weak());
+}
+
+fn file_cell(ui: &mut egui::Ui, rect: egui::Rect, text: egui::RichText) {
+    ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)))
+        .add(egui::Label::new(text).truncate().selectable(false));
+}
+
+/// One file, one row. The name/date area expands details; Open is a separate hit target.
+/// Persistent numeric IDs keep expansion attached to the file across refreshes and sorting.
+pub fn file_row(ui: &mut egui::Ui, id: u64, name: &str, timestamp: &str, add_details: impl FnOnce(&mut egui::Ui)) -> bool {
+    ui.push_id(("cloud.file", id), |ui| {
+        let t = palette(ui.ctx());
+        let name = file_name(name);
+        let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id("details"), false);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), FILE_ROW_HEIGHT), egui::Sense::hover());
+        let (name_rect, date_rect, open_rect) = file_columns(rect);
+        let details_rect = egui::Rect::from_min_max(rect.min, egui::pos2(open_rect.left() - 4.0, rect.bottom()));
+        let mut details = ui.interact(details_rect, state.id(), egui::Sense::click());
+        if details.clicked() {
+            details.request_focus();
+            state.toggle(ui);
+            details.mark_changed();
+        }
+        details.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::CollapsingHeader, ui.is_enabled(), state.is_open(), format!("Details for {name}")));
+        let highlighted = state.is_open() || details.has_focus();
+        let fill = if details.hovered() {
+            t.hover
+        } else if highlighted {
+            t.accent_soft
+        } else {
+            t.field
+        };
+        ui.painter().rect_filled(rect, t.radius_sm, fill);
+        ui.painter().rect_stroke(
+            rect,
+            t.radius_sm,
+            egui::Stroke::new(1.0, if highlighted { t.accent_border } else { t.field_border }),
+            egui::StrokeKind::Inside,
+        );
+        let icon = egui::Rect::from_center_size(egui::pos2(rect.left() + 16.0, rect.center().y), egui::vec2(12.0, 12.0));
+        egui::collapsing_header::paint_default_icon(ui, state.openness(ui.ctx()), &details.clone().with_new_rect(icon));
+        file_cell(ui, name_rect, egui::RichText::new(&name).strong());
+        file_cell(ui, date_rect, egui::RichText::new(timestamp).small().weak());
+        details
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(format!("{name}\nLast saved {timestamp}\nClick to {} version history", if state.is_open() { "hide" } else { "show" }));
+        let open = ui.put(open_rect, egui::Button::new("Open file")).on_hover_text(format!("Open the latest saved version of {name}")).clicked();
+        state.show_body_unindented(ui, |ui| {
+            egui::Frame::new().fill(t.card).stroke(egui::Stroke::new(1.0, t.card_border)).corner_radius(t.radius_sm).inner_margin(14.0).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                add_details(ui);
+            });
+        });
+        open
+    })
+    .inner
 }
 
 #[cfg(test)]
@@ -166,6 +260,50 @@ mod tests {
     use super::*;
     use egui_kittest::{Harness, kittest::Queryable};
     use photocraft_ui_egui::PhotocraftApp;
+
+    #[test]
+    fn launcher_tracks_the_toolbar_center_across_themes_and_layout_changes() {
+        let output = std::env::var("PHOTOCRAFT_CLOUD_PREVIEWS").ok();
+        for (index, theme) in ThemeKind::ALL.into_iter().enumerate() {
+            let builder = Harness::builder().with_size(egui::vec2(760.0, 130.0));
+            let builder = if output.is_some() { builder.wgpu() } else { builder };
+            let mut h = builder.build_ui_state(
+                |ui, state: &mut (f32, bool)| {
+                    let t = Tokens::get(ui.ctx());
+                    egui::Panel::top("title_bar").exact_size(if t.pro { 32.0 } else { 38.0 }).show(ui, |ui| {
+                        ui.horizontal_centered(|ui| ui.label("PhotoCraft"));
+                    });
+                    if state.1 {
+                        egui::Panel::top("options_bar").exact_size(state.0).show(ui, |ui| {
+                            ui.horizontal_centered(|ui| {
+                                let _ = ui.button("Toolbar control");
+                            });
+                        });
+                    }
+                    launcher(ui.ctx(), state.1);
+                },
+                (if Tokens::for_kind(theme).pro { 36.0 } else { 42.0 }, true),
+            );
+            PhotocraftApp::setup_context(&h.ctx, theme);
+            h.run_steps(3);
+            let cloud = h.get_by_label("Sovereign Cloud").rect();
+            let neighbor = h.get_by_label("Toolbar control").rect();
+            assert!((cloud.center().y - neighbor.center().y).abs() <= 0.5, "{theme:?}: launcher is not centered with its neighbors");
+            assert!(cloud.height() <= neighbor.height() + 4.0, "{theme:?}: launcher label must stay on one line");
+            if let Some(dir) = &output {
+                h.render().unwrap().save(format!("{dir}/cloud-launcher-{index}.png")).unwrap();
+            }
+            h.state_mut().0 = 56.0;
+            h.run_steps(3);
+            let cloud = h.get_by_label("Sovereign Cloud").rect();
+            let row = egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new("options_bar")).unwrap().outer_rect;
+            assert!((cloud.center().y - row.center().y).abs() <= 0.5);
+            assert!(row.contains_rect(cloud));
+            h.state_mut().1 = false;
+            h.run_steps(3);
+            assert!(h.query_by_label("Sovereign Cloud").is_none());
+        }
+    }
 
     #[test]
     fn naming_dialog_confirms_once_and_can_be_cancelled() {
@@ -203,10 +341,73 @@ mod tests {
     }
 
     #[test]
+    fn file_row_expands_from_date_or_keyboard_and_open_does_not_toggle_it() {
+        let mut h = Harness::builder().with_size(egui::vec2(720.0, 360.0)).build_ui_state(
+            |ui, opens: &mut usize| {
+                style(ui);
+                if file_row(ui, 7, "Poster", "07/10/2026, 10:25:00", |ui| {
+                    ui.label("Version history");
+                }) {
+                    *opens += 1;
+                }
+            },
+            0,
+        );
+        h.run_steps(3);
+        assert!(h.query_by_label("Version history").is_none());
+        h.get_by_label("Open file").click();
+        h.run_steps(3);
+        assert_eq!(*h.state(), 1);
+        assert!(h.query_by_label("Version history").is_none());
+        // The date is part of the expansion target, not a separate inert cell.
+        h.get_by_label("07/10/2026, 10:25:00").click();
+        h.run_steps(20);
+        assert!(h.query_by_label("Version history").is_some());
+        assert_eq!(*h.state(), 1);
+        h.get_by_label("Details for Poster.pcraft").click();
+        h.run_steps(20);
+        assert!(h.query_by_label("Version history").is_none());
+        // Clicking the header also gives it keyboard focus.
+        h.key_press(egui::Key::Enter);
+        h.run_steps(20);
+        assert!(h.query_by_label("Version history").is_some());
+        h.get_by_label("Open file").click();
+        h.run_steps(3);
+        assert_eq!(*h.state(), 2);
+        assert!(h.query_by_label("Version history").is_some());
+    }
+
+    #[test]
+    fn file_expansion_follows_id_when_rows_are_reordered() {
+        let mut h = Harness::builder().with_size(egui::vec2(720.0, 360.0)).build_ui_state(
+            |ui, reverse: &mut bool| {
+                let mut rows = [(1, "Poster"), (2, "Landscape")];
+                if *reverse {
+                    rows.reverse();
+                }
+                for (id, name) in rows {
+                    file_row(ui, id, name, "07/10/2026, 10:25:00", |ui| {
+                        ui.label(format!("History of {name}"));
+                    });
+                }
+            },
+            false,
+        );
+        h.get_by_label("Details for Poster.pcraft").click();
+        h.run_steps(20);
+        assert!(h.query_by_label("History of Poster").is_some());
+        assert!(h.query_by_label("History of Landscape").is_none());
+        *h.state_mut() = true;
+        h.run_steps(3);
+        assert!(h.query_by_label("History of Poster").is_some());
+        assert!(h.query_by_label("History of Landscape").is_none());
+    }
+
+    #[test]
     fn cloud_views_render_in_all_themes() {
         let output = std::env::var("PHOTOCRAFT_CLOUD_PREVIEWS").ok();
         for (index, theme) in ThemeKind::ALL.into_iter().enumerate() {
-            for width in [360.0, 520.0] {
+            for width in [420.0, 760.0] {
                 for view in ["files", "saving"] {
                     let builder = Harness::builder().with_size(egui::vec2(width, 560.0));
                     let builder = if output.is_some() { builder.wgpu() } else { builder };
@@ -214,20 +415,25 @@ mod tests {
                         style(ui);
                         header(ui);
                         ui.add_space(8.0);
-                        section(ui).show(ui, |ui| {
-                            if view == "files" {
-                                ui.heading("My files");
-                                ui.weak("1 file · Times shown in your local timezone");
-                                ui.add_space(12.0);
-                                file_summary(ui, "Poster", "07/10/2026, 01:25:00", 3 * 1024 * 1024);
-                                ui.separator();
-                                ui.label("Version history");
-                                revision_row(ui, "07/10/2026, 01:25:00", 3 * 1024 * 1024, true);
-                            } else {
-                                ui.heading("My files");
-                                ui.weak("Your saved files will appear here.");
+                        if view == "files" {
+                            ui.heading("My files");
+                            ui.weak("4 files · Times shown in your local timezone");
+                            file_column_labels(ui);
+                            for (id, name, time) in [
+                                (1, "Poster", "07/10/2026, 10:25:00"),
+                                (2, "Landscape study", "06/10/2026, 18:10:00"),
+                                (3, "Brand exploration — a deliberately long file name", "05/10/2026, 09:45:00"),
+                                (4, "色彩 — värvid", "04/10/2026, 12:30:00"),
+                            ] {
+                                file_row(ui, id, name, time, |ui| {
+                                    ui.strong("Version history (2)");
+                                    revision_row(ui, time, 3 * 1024 * 1024, true);
+                                });
                             }
-                        });
+                        } else {
+                            ui.heading("My files");
+                            ui.weak("Your saved files will appear here.");
+                        }
                         ui.add_space(12.0);
                         if view == "saving" {
                             transfer(ui, "Uploading your file…", Some(0.625));
@@ -238,14 +444,22 @@ mod tests {
                     PhotocraftApp::setup_context(&h.ctx, theme);
                     h.run_steps(3);
                     if view == "files" {
-                        assert!(h.query_by_label("Open file").is_some());
-                        assert!(h.query_by_label("07/10/2026, 01:25:00").is_some());
+                        assert!(h.query_by_label("Details for Poster.pcraft").is_some());
+                        assert!(h.query_by_label("Version history (2)").is_none());
                     } else {
                         assert!(h.query_by_label("Save").is_none());
                         assert!(h.query_by_label("Save file").is_none());
                     }
                     if let Some(dir) = &output {
                         h.render().unwrap().save(format!("{dir}/cloud-{view}-{index}-{width}.png")).unwrap();
+                    }
+                    if view == "files" {
+                        h.get_by_label("Details for Landscape study.pcraft").click();
+                        h.run_steps(20);
+                        assert!(h.query_by_label("Version history (2)").is_some());
+                        if let Some(dir) = &output {
+                            h.render().unwrap().save(format!("{dir}/cloud-expanded-{index}-{width}.png")).unwrap();
+                        }
                     }
                 }
             }

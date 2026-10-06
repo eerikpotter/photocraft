@@ -2,10 +2,6 @@
 use super::*;
 use presentation::{RevisionAction, SaveAction};
 
-fn logo() -> egui::Image<'static> {
-    egui::Image::new(egui::include_image!("../../assets/icp/logo.svg")).fit_to_exact_size(egui::vec2(28.0, 16.0))
-}
-
 impl Cloud {
     pub fn ui(&mut self, ctx: &egui::Context, app: &mut PhotocraftApp) {
         self.poll(app, ctx);
@@ -19,30 +15,21 @@ impl Cloud {
         if self.notice.as_ref().and_then(|n| n.expires).is_some_and(|until| js_sys::Date::now() >= until) {
             self.notice = None;
         }
-        egui::Area::new(egui::Id::new("photocraft.cloud.launcher")).anchor(egui::Align2::RIGHT_TOP, [-18.0, 36.0]).order(egui::Order::Foreground).show(
-            ctx,
-            |ui| {
-                if ui
-                    .add(egui::Button::image_and_text(logo(), "Sovereign Cloud"))
-                    .on_hover_text("Your cloud files and version history. Also available from the File menu.")
-                    .clicked()
-                {
-                    self.visible = !self.visible;
-                    if self.visible {
-                        self.view = View::Projects;
-                    }
-                    if self.visible && !self.busy && self.principal().is_some() {
-                        self.refresh(ctx);
-                    }
-                }
-            },
-        );
+        if presentation::launcher(ctx, app.ui.panels.options_bar && !app.ui.view.hides_chrome()) {
+            self.visible = !self.visible;
+            if self.visible {
+                self.view = View::Projects;
+            }
+            if self.visible && !self.busy && self.principal().is_some() {
+                self.refresh(ctx);
+            }
+        }
         let mut visible = self.visible;
         let t = presentation::palette(ctx);
         egui::Window::new("Sovereign Cloud")
-            .id(egui::Id::new("photocraft.cloud.window")).open(&mut visible)
+            .id(egui::Id::new("photocraft.cloud.library.window")).open(&mut visible)
             .frame(egui::Frame::window(&ctx.global_style()).fill(t.dock).stroke(egui::Stroke::new(1.0, t.accent_border)).corner_radius(t.radius_lg).inner_margin(16.0))
-            .default_width(520.0).min_width(340.0).default_pos([560.0, 90.0]).vscroll(true)
+            .default_size([760.0, 560.0]).min_width(420.0).default_pos([400.0, 80.0]).vscroll(true)
             .show(ctx, |ui| {
                 presentation::style(ui);
                 presentation::header(ui);
@@ -63,12 +50,9 @@ impl Cloud {
                     });
                     ui.add_space(8.0);
                     if self.busy { presentation::transfer(ui, &self.status, self.progress); ui.add_space(8.0); }
-                    presentation::section(ui).show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.add_enabled_ui(!self.busy, |ui| match self.view {
-                            View::Save => self.save_view(ui, app, ctx),
-                            View::Projects => self.projects_view(ui, ctx),
-                        });
+                    ui.add_enabled_ui(!self.busy, |ui| match self.view {
+                        View::Save => { presentation::section(ui).show(ui, |ui| self.save_view(ui, app, ctx)); },
+                        View::Projects => self.projects_view(ui, ctx),
                     });
                     if !self.busy { self.retry_view(ui, ctx); }
                 } else {
@@ -183,7 +167,7 @@ impl Cloud {
                 }
             });
         });
-        ui.weak("Saved files · Times shown in your local timezone");
+        ui.weak("Click a row for version history · Times shown in your local timezone");
         ui.add_space(12.0);
         let mut files = self.projects.clone();
         files.sort_by_key(|p| std::cmp::Reverse(p.revisions.last().map_or(p.created_at, |r| r.created_at)));
@@ -191,29 +175,28 @@ impl Cloud {
             ui.label("Your saved files will appear here.");
             ui.weak("Use File → Save to Cloud in the editor to save your first file.");
         }
-        egui::ScrollArea::vertical().id_salt("cloud_files").max_height(330.0).show(ui, |ui| {
-            for p in files.iter().filter(|p| !p.revisions.is_empty()) {
-                let Some(latest) = p.revisions.last() else {
-                    continue;
-                };
-                ui.push_id(p.id, |ui| {
-                    if presentation::file_summary(ui, &p.name, &timestamp(latest.created_at), latest.bytes) {
-                        self.open(p.clone(), latest.clone(), ctx);
-                    }
-                    ui.collapsing(format!("Version history ({})", p.revisions.len()), |ui| {
-                        for r in p.revisions.iter().rev() {
-                            ui.push_id(r.id, |ui| match presentation::revision_row(ui, &timestamp(r.created_at), r.bytes, r.id == latest.id) {
-                                Some(RevisionAction::Open) => self.open(p.clone(), r.clone(), ctx),
-                                Some(RevisionAction::Delete) => self.delete = Some((r.id, "delete_revision_or_upload".into())),
-                                None => {}
-                            });
-                        }
+        if files.iter().any(|p| !p.revisions.is_empty()) {
+            presentation::file_column_labels(ui);
+        }
+        // The window owns the only scrollbar; file rows and expanded history flow naturally.
+        for p in files.iter().filter(|p| !p.revisions.is_empty()) {
+            let Some(latest) = p.revisions.last() else {
+                continue;
+            };
+            let open = presentation::file_row(ui, p.id, &p.name, &timestamp(latest.created_at), |ui| {
+                ui.strong(format!("Version history ({})", p.revisions.len()));
+                for r in p.revisions.iter().rev() {
+                    ui.push_id(r.id, |ui| match presentation::revision_row(ui, &timestamp(r.created_at), r.bytes, r.id == latest.id) {
+                        Some(RevisionAction::Open) => self.open(p.clone(), r.clone(), ctx),
+                        Some(RevisionAction::Delete) => self.delete = Some((r.id, "delete_revision_or_upload".into())),
+                        None => {}
                     });
-                    ui.separator();
-                    ui.add_space(6.0);
-                });
+                }
+            });
+            if open {
+                self.open(p.clone(), latest.clone(), ctx);
             }
-        });
+        }
         let unfinished: Vec<_> = files.iter().filter(|p| p.revisions.is_empty() || p.pending_upload.is_some()).collect();
         if !unfinished.is_empty() {
             ui.add_space(12.0);
