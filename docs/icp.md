@@ -164,6 +164,10 @@ verifies certification; this byte check is not a separate cryptographic security
 Validated locally on 2026-10-06–07:
 
 - Five backend unit/contract tests passed.
+- An additional PocketIC authorization test passes against every file API: two principals and
+  an anonymous caller, pending and committed uploads, mixed file/revision IDs, and checks
+  before and after upgrade. Unauthorized calls leave the owner's bytes intact. This tests
+  application authorization; it is not proof of end-to-end confidentiality.
 - Two PocketIC integration tests passed: ownership, interrupted upload, exact-byte retrieval
   and repeated upgrades; plus a full 64 MiB / 128-chunk upload and commit within the default
   canister execution budget.

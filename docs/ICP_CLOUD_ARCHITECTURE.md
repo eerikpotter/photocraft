@@ -120,6 +120,27 @@ node operators. This milestone provides access control, **not end-to-end encrypt
 The canister controllers retain upgrade authority. Publish the controller/governance model,
 network/subnet, operator and data-location assumptions for each actual deployment.
 
+The stronger requirement is that only the owner and explicitly authorized people or agents
+may obtain file contents. Current application-level isolation is covered by an endpoint
+regression test with two principals and an anonymous caller, before and after upgrade.
+It does **not** prove confidentiality against controllers, compromised clients or node operators.
+See ICP's [security model](https://docs.internetcomputer.org/concepts/security/) and
+[controller model](https://docs.internetcomputer.org/concepts/canisters/#controllers).
+
+Before claiming that stronger confidentiality, add client-side authenticated encryption for
+file contents and sensitive metadata, recipient-controlled key access and recovery, and a
+reviewed trust model for both frontend and backend upgrades. Encryption alone cannot defeat
+a malicious replacement frontend or a replaceable key-authorization service. Threshold keys
+such as [vetKeys](https://docs.internetcomputer.org/concepts/vetkeys/) are a candidate, not
+an automatic solution to controller trust.
+
+Future sharing must deny access by default, check per-file read/write/manage permissions on
+every API call, and keep agent identities separate from the owner's identity. Agent grants
+must be explicit, narrowly scoped, expiring and revocable; neither a recipient nor an agent
+may increase its own privileges. Record grants, revocations and changes. Revocation prevents
+future authorized access; it cannot erase plaintext or keys already copied by a prior recipient.
+PocketIC is a development/test environment, not a production confidentiality boundary.
+
 Public ICP and dedicated Cloud Engines share the canister model. Dedicated deployment is
 a target, not a tested guarantee in this milestone. Validate the engine's gateway, identity
 trust, API support and resource/funding model. Future threshold-key features may need an

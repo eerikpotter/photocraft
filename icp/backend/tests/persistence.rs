@@ -96,3 +96,73 @@ fn maximum_document_fits_one_commit_message_budget() {
     assert_eq!(revision.bytes, MAX_DOCUMENT_BYTES);
     assert_eq!(revision.chunk_count, count);
 }
+
+#[test]
+fn every_file_endpoint_denies_other_principals_before_and_after_upgrade() {
+    let wasm = std::fs::read(std::env::var("PHOTOCRAFT_CLOUD_WASM").expect("Set PHOTOCRAFT_CLOUD_WASM")).unwrap();
+    let mut builder = PocketIcBuilder::new().with_application_subnet();
+    if let Ok(url) = std::env::var("POCKET_IC_SERVER_URL") {
+        builder = builder.with_server_url(url.parse().unwrap());
+    }
+    let pic = builder.build();
+    let canister = pic.create_canister();
+    pic.add_cycles(canister, 20_000_000_000_000);
+    pic.install_canister(canister, wasm.clone(), encode_args(()).unwrap(), None);
+    let alice = Principal::self_authenticating([11; 32]);
+    let bob = Principal::self_authenticating([12; 32]);
+    let anonymous = Principal::anonymous();
+    let alice_file: Project = call(&pic, canister, alice, "create_project", ("Alice private file",)).unwrap();
+    let bob_file: Project = call(&pic, canister, bob, "create_project", ("Bob private file",)).unwrap();
+    let bytes = b"private document bytes".to_vec();
+    let request = BeginUpload {
+        project_id: alice_file.id,
+        expected_revision: None,
+        bytes: bytes.len() as u64,
+        sha256: Sha256::digest(&bytes).to_vec(),
+        request_id: "authorization-matrix-01".into(),
+    };
+    let upload: Upload = call(&pic, canister, alice, "begin_upload", (request.clone(),)).unwrap();
+    // Pending uploads are protected, including discard and direct chunk writes.
+    for caller in [bob, anonymous] {
+        assert!(call::<Upload>(&pic, canister, caller, "begin_upload", (request.clone(),)).is_err());
+        assert!(call::<()>(&pic, canister, caller, "put_chunk", (upload.id, 0u64, bytes.clone())).is_err());
+        assert!(call::<Revision>(&pic, canister, caller, "commit_upload", (upload.id,)).is_err());
+        assert!(call::<()>(&pic, canister, caller, "delete_revision_or_upload", (upload.id,)).is_err());
+        assert!(call::<()>(&pic, canister, caller, "delete_project", (alice_file.id,)).is_err());
+    }
+    call::<()>(&pic, canister, alice, "put_chunk", (upload.id, 0u64, bytes.clone())).unwrap();
+    let revision: Revision = call(&pic, canister, alice, "commit_upload", (upload.id,)).unwrap();
+    for upgraded in [false, true] {
+        if upgraded {
+            pic.upgrade_canister(canister, wasm.clone(), encode_args(()).unwrap(), None).unwrap();
+        }
+        let alice_files: Vec<Project> = call(&pic, canister, alice, "list_projects", ()).unwrap();
+        let bob_files: Vec<Project> = call(&pic, canister, bob, "list_projects", ()).unwrap();
+        assert_eq!(alice_files.iter().map(|p| p.id).collect::<Vec<_>>(), [alice_file.id]);
+        assert_eq!(bob_files.iter().map(|p| p.id).collect::<Vec<_>>(), [bob_file.id]);
+        assert!(call::<Vec<Project>>(&pic, canister, anonymous, "list_projects", ()).is_err());
+        assert!(call::<Project>(&pic, canister, anonymous, "create_project", ("Anonymous",)).is_err());
+        for caller in [bob, anonymous] {
+            assert!(call::<Revision>(&pic, canister, caller, "get_revision", (alice_file.id, revision.id)).is_err());
+            let denied = pic.query_call(canister, caller, "get_chunk", encode_args((alice_file.id, revision.id, 0u64)).unwrap()).unwrap();
+            assert!(decode_one::<CloudResult<Vec<u8>>>(&denied).unwrap().is_err());
+            assert!(call::<Upload>(&pic, canister, caller, "begin_upload", (request.clone(),)).is_err());
+            assert!(call::<()>(&pic, canister, caller, "put_chunk", (upload.id, 0u64, bytes.clone())).is_err());
+            // Even the idempotent commit shortcut must check ownership first.
+            assert!(call::<Revision>(&pic, canister, caller, "commit_upload", (upload.id,)).is_err());
+            assert!(call::<()>(&pic, canister, caller, "delete_revision_or_upload", (revision.id,)).is_err());
+            assert!(call::<()>(&pic, canister, caller, "delete_project", (alice_file.id,)).is_err());
+        }
+        // A valid owned file ID cannot be paired with someone else's revision ID.
+        assert!(call::<Revision>(&pic, canister, bob, "get_revision", (bob_file.id, revision.id)).is_err());
+        let denied = pic.query_call(canister, bob, "get_chunk", encode_args((bob_file.id, revision.id, 0u64)).unwrap()).unwrap();
+        assert!(decode_one::<CloudResult<Vec<u8>>>(&denied).unwrap().is_err());
+        let actual = pic.query_call(canister, alice, "get_chunk", encode_args((alice_file.id, revision.id, 0u64)).unwrap()).unwrap();
+        assert_eq!(decode_one::<CloudResult<Vec<u8>>>(&actual).unwrap().unwrap(), bytes);
+        assert_eq!(call::<Revision>(&pic, canister, alice, "get_revision", (alice_file.id, revision.id)).unwrap(), revision);
+    }
+    call::<()>(&pic, canister, alice, "delete_revision_or_upload", (revision.id,)).unwrap();
+    call::<()>(&pic, canister, alice, "delete_project", (alice_file.id,)).unwrap();
+    assert!(call::<Vec<Project>>(&pic, canister, alice, "list_projects", ()).unwrap().is_empty());
+    assert_eq!(call::<Vec<Project>>(&pic, canister, bob, "list_projects", ()).unwrap()[0].id, bob_file.id);
+}
