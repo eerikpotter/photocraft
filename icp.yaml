@@ -1,4 +1,5 @@
 canisters:
+  - icp/backend
   - name: frontend
     recipe:
       type: "@dfinity/static-site@v0.4.0"
