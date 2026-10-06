@@ -3,6 +3,7 @@
 
 import base64
 import hashlib
+import json
 from html.parser import HTMLParser
 from pathlib import Path
 import shutil
@@ -48,6 +49,13 @@ def prepare(site):
     ])
     headers = (root / "packaging/web/_headers").read_text()
     headers += "\n/*\n  Referrer-Policy: no-referrer\n  Content-Security-Policy: " + policy + "\n"
+    metadata = site / ".well-known" / "ii-app-metadata"
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    metadata.write_text(json.dumps({
+        "name": "PhotoCraft Sovereign Cloud",
+        "description": "Local creative tools with owner-controlled cloud projects on the Internet Computer.",
+    }))
+    headers += "\n/.well-known/ii-app-metadata\n  Content-Type: application/json\n  Access-Control-Allow-Origin: *\n"
     (site / "_headers").write_text(headers)
     for name in ["LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "ATTRIBUTION.md"]:
         shutil.copy2(root / name, site / name)
@@ -56,6 +64,10 @@ def prepare(site):
             destination = site / "licenses" / source.relative_to(root / "assets")
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
+    icp_notices = site / "licenses" / "icp"
+    icp_notices.mkdir(parents=True, exist_ok=True)
+    for name in ["LICENSE", "README.md"]:
+        shutil.copy2(root / "apps" / "photocraft-web" / "assets" / "icp" / name, icp_notices / name)
     print(f"Prepared {site}: Wasm CSP, caching, MIME type and attribution notices")
 
 

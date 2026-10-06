@@ -6,5 +6,5 @@ export PATH="$ROOT/.tools/bin:$PATH"
 # The locked egui 0.36.2 dependencies require Rust 1.95.
 export RUSTUP_TOOLCHAIN="${PHOTOCRAFT_WEB_TOOLCHAIN:-1.95.0}"
 command -v trunk >/dev/null || { echo "Install Trunk 0.21.14 (see docs/icp.md)." >&2; exit 1; }
-(cd "$ROOT/apps/photocraft-web" && env -u NO_COLOR trunk build --release --locked --color never)
+(cd "$ROOT/apps/photocraft-web" && env -u NO_COLOR trunk build --release --locked --features icp-cloud --color never)
 python3 "$ROOT/packaging/icp/prepare.py" "$ROOT/dist/web"

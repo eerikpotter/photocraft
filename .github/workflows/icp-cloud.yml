@@ -1,0 +1,40 @@
+name: ICP cloud
+on:
+  pull_request:
+  push:
+    branches: [main, 'codex/**']
+
+permissions:
+  contents: read
+
+jobs:
+  cloud:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: icp
+      - run: cargo fmt --manifest-path icp/Cargo.toml --all --check
+      - run: cargo clippy --manifest-path icp/Cargo.toml --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --manifest-path icp/Cargo.toml -p photocraft-cloud --lib --locked
+      - run: cargo build --manifest-path icp/Cargo.toml -p photocraft-cloud --target wasm32-unknown-unknown --release --locked
+      - name: PocketIC storage and upgrade test
+        run: PHOTOCRAFT_CLOUD_WASM="$GITHUB_WORKSPACE/icp/target/wasm32-unknown-unknown/release/photocraft_cloud.wasm" cargo test --manifest-path icp/Cargo.toml -p photocraft-cloud --test persistence --locked
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p photocraft-web --target wasm32-unknown-unknown --locked
+      - run: cargo clippy -p photocraft-web --features icp-cloud --target wasm32-unknown-unknown --no-deps --locked -- -D warnings
+      - run: cargo xtask layers

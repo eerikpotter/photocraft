@@ -1,13 +1,33 @@
-<p align="center">
-  <a href="https://getartcraft.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
-    </picture>
-  </a>
-</p>
+<h1 align="center">PhotoCraft × ICP Cloud</h1>
 
-<h1 align="center">PhotoCraft</h1>
+**An Open SaaS evolution of [PhotoCraft](https://github.com/storytold/photocraft):
+local creative tools with a sovereign cloud backend on the Internet Computer.**
+
+> Open source opened the code. The next step is to open the cloud.
+
+This independent fork builds on PhotoCraft by the ArtCraft team and community.
+Its Rust/Wasm editor runs on your device; ICP delivers the application and provides
+identity, persistent project storage and owner-controlled revision history. The cloud
+service requires no conventional application server, database or object-storage service.
+
+**Local compute. Network-native state. Sovereign cloud.**
+
+The first cloud milestone adds Internet Identity sign-in, explicit save/open, chunked
+`.pcraft` uploads, checksum verification and revisions that survive canister upgrades.
+It is an early demonstration, not a claim of complete Photoshop parity or production
+readiness. Sharing, collaboration, agent permissions and dedicated Cloud Engine validation
+are future phases. Documents are access-controlled, not end-to-end encrypted.
+
+- [Architecture and development phases](docs/ICP_CLOUD_ARCHITECTURE.md)
+- [Run locally and deploy to ICP](docs/icp.md)
+- [Maintain the fork and integrate upstream](docs/ICP_CLOUD_ARCHITECTURE.md#upstream-integration)
+- [Original PhotoCraft project](https://github.com/storytold/photocraft)
+
+The core editor and its file format remain upstream-compatible. Cloud code is isolated in
+`icp/` and the optional `icp-cloud` browser feature. The native editor retains its normal build.
+The overview below describes the upstream editor on which this fork is based.
+
+---
 
 <p align="center">
   <b>Image editing; an open-source, clean-room reimplementation of Adobe Photoshop, rebuilt in pure Rust.</b><br>
@@ -354,17 +374,11 @@ with its author, source and license in [ATTRIBUTION.md](ATTRIBUTION.md).
 
 Every artwork shown is in the public domain (Wikimedia Commons, NASA, U.S. National Archives); sources are listed in [`docs/images/SOURCES.md`](docs/images/SOURCES.md).
 
-The ArtCraft name, wordmark and logos in [`docs/brand/`](docs/brand/) are trademarks of the
-ArtCraft Team and are not covered by this license. They may be used only unmodified, and only as
-part of this repository and PhotoCraft, under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt).
-Forks and modified versions must remove them.
+ArtCraft is a trademark of the ArtCraft Team. This fork removes the upstream logo assets
+under their [brand license](docs/brand/LICENSE-brand.txt) and does not imply upstream endorsement.
 
 <sub>Adobe, Photoshop, Illustrator, Premiere Pro, Lightroom, Acrobat, After Effects and InDesign are trademarks or registered trademarks of Adobe Inc. in the United States and/or other countries. PhotoCraft is an independent, open-source project and is not affiliated with, sponsored by or endorsed by Adobe Inc.; these names are used only to describe the workflows it is compatible with.</sub>
 
 <p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
-  <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
+  <sub>Based on PhotoCraft by the <a href="https://getartcraft.com/">ArtCraft</a> team and community. ICP cloud extensions are maintained independently in this fork.</sub>
 </p>
-
-
-ArtCraft
