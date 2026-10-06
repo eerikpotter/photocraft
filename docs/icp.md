@@ -60,20 +60,22 @@ ICP_CLI_PLUGIN_COMPUTE_LIMIT_SECS=300 icp sync frontend -e local
 ### Browser demonstration
 
 1. Open/create a document using the normal editor.
-2. Choose **File → Save to Cloud…**, or open **Sovereign Cloud** (the ICP infinity-logo
-   button at the top right). Sign in with Internet Identity; **Account** contains your identity.
-3. In **Save file**, enter a file name and select **Save file**. The loader appears before
-   encoding, followed by upload progress and **Finishing save…**. Wait for the dated **Saved**
-   activity confirmation. A linked file has one primary action, **Save changes**; **More… →
-   Save a copy…** reveals a separate naming flow for an independent copy.
-4. Edit and choose **File → Save to Cloud…** again to save another version of the linked file.
+2. Choose **File → Save to Cloud…**. Sign in with Internet Identity if needed.
+3. The first save asks for a file name. Select **Save** once; the naming dialog is replaced by
+   the file manager and progress. The loader appears before encoding, followed by upload
+   progress and **Finishing save…**. Wait for the dated **Saved** activity confirmation.
+4. Edit and choose **File → Save to Cloud…** again: changes upload directly, without another
+   confirmation. Repeating a save at the same document revision reports **already saved**
+   without uploading. Use
+   **File → Save a Copy to Cloud…** to name an independent copy. The Sovereign Cloud launcher
+   opens file management; it has no general save button or save tab.
 5. Reload, sign in if necessary, and choose **File → Open from Cloud…**. **My files** lists
    completed saves; select **Open file**, or expand **Version history** for earlier versions.
    File and version timestamps use your device's local timezone. Activity messages are
    dismissible and expire after eight seconds; errors stay visible until dismissed.
 6. Use a second browser/device at the same application origin and sign in to the same II account.
-7. Test interrupted saves: the previous version remains available; **Retry save** in **Save
-   file** resumes the captured in-memory snapshot. **Dismiss attempt** lets you save current
+7. Test interrupted saves: the previous version remains available; **Retry save** below the file list
+   resumes the captured in-memory snapshot. **Dismiss attempt** lets you save current
    edits instead. In **My files → Unfinished saves**, discard interrupted uploads before
    saving anew. Unfinished saves are not openable files.
 
@@ -189,8 +191,9 @@ Validated locally on 2026-10-06–07:
   document, enabled Save to Cloud after creating one, and both menu routes opening the cloud
   manager. The updated build's certified asset and runtime-configuration checks pass. The
   signed-in controls are additionally exercised with synthetic data in shared-widget tests.
-- Four cloud presentation tests pass: file extensions, the secondary copy flow, blocked
-  saves while busy/invalid, and file/progress layouts across all five themes at two widths.
+- Five cloud flow/presentation tests pass: unchanged-save routing, first-save/copy naming,
+  file extensions, blocked saves while busy/invalid, and file/progress layouts across all
+  five themes at two widths.
   Twenty offscreen PNGs were rendered; dark and light layouts were visually inspected.
   These test the actual browser widgets without bypassing Internet Identity. Strict native
   adapter and Wasm clippy, the ordinary web check and all 27 layer checks pass.
@@ -198,6 +201,10 @@ Validated locally on 2026-10-06–07:
   a fresh browser tab. Certified assets/runtime configuration/II metadata pass; browser
   error logs are empty. Authenticated save/copy/retry on this exact build still needs the
   interactive account smoke test above.
+- The File-menu-only follow-up also deployed successfully: save/copy actions are disabled
+  without a document, enabled with a synthetic document, and the copy route opens the cloud
+  sign-in flow. Certified served assets/configuration pass; no browser errors. The duplicate
+  save controls are absent from the shared file/progress layouts.
 
 The earlier delivery proof of concept rendered with WebGPU and forced WebGL2, imported an
 image, painted and undid a stroke. PNG export reported success in the app, but automation did

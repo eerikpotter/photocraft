@@ -1,5 +1,6 @@
 //! Optional browser/cloud adapter. No changes to the upstream engine or document format.
 mod api;
+mod flow;
 mod panel;
 mod presentation;
 use api::{Api, args};
@@ -27,7 +28,7 @@ struct Attempt {
     doc_revision: u64,
 }
 enum Event {
-    RequestSave,
+    RequestSave(bool),
     RequestProjects,
     Initialized,
     SignedIn,
@@ -44,6 +45,12 @@ enum Event {
 enum View {
     Save,
     Projects,
+}
+struct Binding {
+    owner: Principal,
+    file: u64,
+    version: u64,
+    document_revision: u64,
 }
 struct PendingSave {
     document: Arc<photocraft_doc::Document>,
@@ -71,7 +78,7 @@ pub struct Cloud {
     named_doc: Option<u64>,
     name: String,
     projects: Vec<Project>,
-    bindings: BTreeMap<u64, (Principal, u64, u64)>,
+    bindings: BTreeMap<u64, Binding>,
     attempt: Option<Attempt>,
     delete: Option<(u64, String)>,
 }
@@ -117,19 +124,21 @@ impl Cloud {
         }
     }
     pub fn install_commands(&self, services: &mut photocraft_ui_egui::Services, ctx: &egui::Context) {
-        for (id, label, after, save) in
-            [("host.cloud.save", "Save to Cloud…", "file.saveAs", true), ("host.cloud.projects", "Open from Cloud…", "host.cloud.save", false)]
-        {
+        for (id, label, after, copy) in [
+            ("host.cloud.save", "Save to Cloud…", "file.saveAs", Some(false)),
+            ("host.cloud.save_copy", "Save a Copy to Cloud…", "host.cloud.save", Some(true)),
+            ("host.cloud.projects", "Open from Cloud…", "host.cloud.save_copy", None),
+        ] {
             let (tx, ctx) = (self.tx.clone(), ctx.clone());
             services.commands.push(photocraft_ui_egui::service_commands::Command {
                 id,
                 label,
                 path: &["File"],
                 after,
-                requires_document: save,
+                requires_document: copy.is_some(),
                 enabled: true,
                 request: Box::new(move || {
-                    tx.send(if save { Event::RequestSave } else { Event::RequestProjects }).map_err(|_| "Cloud service is unavailable".to_string())?;
+                    tx.send(copy.map_or(Event::RequestProjects, Event::RequestSave)).map_err(|_| "Cloud service is unavailable".to_string())?;
                     ctx.request_repaint();
                     Ok(())
                 }),
@@ -196,10 +205,17 @@ impl Cloud {
             self.notify("Open or create a document first", true);
             return;
         };
-        let binding = self.bindings.get(&doc.doc.id.0).filter(|(owner, _, _)| Some(*owner) == self.principal());
-        let project = if copy { None } else { binding.and_then(|(_, id, _)| self.projects.iter().find(|p| p.id == *id)).cloned() };
+        let binding = self.bindings.get(&doc.doc.id.0).filter(|b| Some(b.owner) == self.principal());
+        let project = if copy { None } else { binding.and_then(|b| self.projects.iter().find(|p| p.id == b.file)).cloned() };
         if !copy && binding.is_some() && project.is_none() {
-            self.notify("This cloud file is unavailable. Refresh My files, or choose More → Save a copy.", true);
+            self.notify("This cloud file is unavailable. Refresh My files, or choose File → Save a Copy to Cloud.", true);
+            return;
+        }
+        if flow::route(binding.map(|b| b.document_revision), doc.revision, copy) == flow::SaveRoute::AlreadySaved
+            && project.as_ref().is_some_and(|p| binding.is_some_and(|b| p.revisions.iter().any(|r| r.id == b.version)))
+        {
+            self.view = View::Projects;
+            self.notify("This file is already saved to cloud. No changes to upload.", false);
             return;
         }
         let name = project.as_ref().map_or_else(|| self.name.trim().to_string(), |p| p.name.clone());
@@ -210,7 +226,7 @@ impl Cloud {
         let attempt = Attempt {
             project,
             upload: None,
-            expected: if copy { None } else { binding.map(|(_, _, rev)| *rev) },
+            expected: if copy { None } else { binding.map(|b| b.version) },
             bytes: Arc::new(Vec::new()),
             name,
             request: format!("{}-{}-{}", js_sys::Date::now(), doc.doc.id.0, doc.revision),
@@ -219,6 +235,7 @@ impl Cloud {
         };
         // Capture the immutable document now; paint feedback before synchronous encoding.
         self.pending_save = Some(PendingSave { document: doc.doc.clone(), attempt, ready_frame: ctx.cumulative_frame_nr().saturating_add(2) });
+        self.view = View::Projects;
         self.begin_operation("Preparing your file…");
         ctx.request_repaint();
     }
@@ -391,17 +408,17 @@ impl Cloud {
     fn poll(&mut self, app: &mut PhotocraftApp, ctx: &egui::Context) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
-                Event::RequestSave => {
+                Event::RequestSave(copy) => {
                     self.visible = true;
-                    self.view = View::Save;
-                    self.copy_mode = false;
                     if !self.busy && self.attempt.is_none() {
-                        let linked =
-                            app.session.active().and_then(|d| self.bindings.get(&d.doc.id.0)).is_some_and(|(owner, _, _)| Some(*owner) == self.principal());
-                        if linked {
+                        self.copy_mode = copy;
+                        let binding = app.session.active().and_then(|d| self.bindings.get(&d.doc.id.0)).filter(|b| Some(b.owner) == self.principal());
+                        if binding.is_some() && !copy {
                             self.save(app, ctx, false);
                         } else if let Some(doc) = app.session.active() {
-                            self.name = doc.doc.name.clone();
+                            self.view = View::Save;
+                            let name = binding.and_then(|b| self.projects.iter().find(|p| p.id == b.file)).map_or(doc.doc.name.as_str(), |p| p.name.as_str());
+                            self.name = if copy { format!("{} copy", name.strip_suffix(".pcraft").unwrap_or(name)) } else { name.into() };
                             self.named_doc = Some(doc.doc.id.0);
                         }
                     }
@@ -446,10 +463,11 @@ impl Cloud {
                 Event::Prepared(a) => self.attempt = Some(a),
                 Event::Saved(a, r) => {
                     self.busy = false;
+                    self.view = View::Projects;
                     self.attempt = None;
                     self.copy_mode = false;
                     if let Some(mut p) = a.project {
-                        self.bindings.insert(a.doc_id, (p.owner, p.id, r.id));
+                        self.bindings.insert(a.doc_id, Binding { owner: p.owner, file: p.id, version: r.id, document_revision: a.doc_revision });
                         // Only the snapshot that reached consensus is saved. Edits made during upload stay dirty.
                         if let Some(doc) = app.session.active_mut().filter(|d| d.doc.id.0 == a.doc_id && d.revision == a.doc_revision) {
                             doc.saved_revision = a.doc_revision;
@@ -467,7 +485,7 @@ impl Cloud {
                     match app.open_file(&presentation::file_name(&p.name), &bytes) {
                         Ok(_) => {
                             if let Some(doc) = app.session.active() {
-                                self.bindings.insert(doc.doc.id.0, (p.owner, p.id, r.id));
+                                self.bindings.insert(doc.doc.id.0, Binding { owner: p.owner, file: p.id, version: r.id, document_revision: doc.revision });
                             }
                             self.copy_mode = false;
                             self.notify(format!("Opened {} · saved {}", presentation::file_name(&p.name), timestamp(r.created_at)), false);

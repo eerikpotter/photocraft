@@ -28,6 +28,9 @@ impl Cloud {
                     .clicked()
                 {
                     self.visible = !self.visible;
+                    if self.visible {
+                        self.view = View::Projects;
+                    }
                     if self.visible && !self.busy && self.principal().is_some() {
                         self.refresh(ctx);
                     }
@@ -59,13 +62,6 @@ impl Cloud {
                         });
                     });
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let count = self.projects.iter().filter(|p| !p.revisions.is_empty()).count();
-                        if ui.selectable_value(&mut self.view, View::Projects, format!("My files ({count})")).clicked() && !self.busy { self.refresh(ctx); }
-                        ui.selectable_value(&mut self.view, View::Save, "Save file");
-                    });
-                    ui.separator();
-                    ui.add_space(8.0);
                     if self.busy { presentation::transfer(ui, &self.status, self.progress); ui.add_space(8.0); }
                     presentation::section(ui).show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
@@ -74,6 +70,7 @@ impl Cloud {
                             View::Projects => self.projects_view(ui, ctx),
                         });
                     });
+                    if !self.busy { self.retry_view(ui, ctx); }
                 } else {
                     ui.add_space(12.0);
                     presentation::section(ui).show(ui, |ui| {
@@ -107,7 +104,7 @@ impl Cloud {
             });
         self.visible = visible;
         for command in &mut app.services.commands {
-            if command.id == "host.cloud.save" {
+            if matches!(command.id, "host.cloud.save" | "host.cloud.save_copy") {
                 command.enabled = !self.busy && self.attempt.is_none();
             }
         }
@@ -141,31 +138,26 @@ impl Cloud {
     }
 
     fn save_view(&mut self, ui: &mut egui::Ui, app: &PhotocraftApp, ctx: &egui::Context) {
-        if let Some(doc) = app.session.active() {
-            let binding = self.bindings.get(&doc.doc.id.0).filter(|(owner, _, _)| Some(*owner) == self.principal());
-            let project = binding.and_then(|(_, id, _)| self.projects.iter().find(|p| p.id == *id)).cloned();
-            let saved = project.as_ref().and_then(|p| p.revisions.last()).map(|r| timestamp(r.created_at)).unwrap_or_default();
-            let linked_name = project.as_ref().map_or(doc.doc.name.as_str(), |p| p.name.as_str());
-            let linked = binding.map(|_| (linked_name, saved.as_str()));
-            match presentation::save_form(ui, &mut self.name, linked, self.copy_mode, self.attempt.is_none()) {
+        if app.session.active().is_some() {
+            match presentation::save_form(ui, &mut self.name, self.copy_mode, self.attempt.is_none()) {
                 Some(SaveAction::Save) => self.save(app, ctx, self.copy_mode),
-                Some(SaveAction::Copy) => {
-                    self.copy_mode = true;
-                    self.name = format!("{} copy", linked_name.strip_suffix(".pcraft").unwrap_or(linked_name));
+                Some(SaveAction::Cancel) => {
+                    self.view = View::Projects;
+                    self.copy_mode = false;
                 }
-                Some(SaveAction::CancelCopy) => self.copy_mode = false,
                 None => {}
             }
-            ui.add_space(12.0);
-            ui.weak("Saves the active document. Further edits need another save.");
         } else {
             ui.heading("No document is open");
             ui.label("Create or open a document in PhotoCraft, then choose File → Save to Cloud.");
         }
+    }
+
+    fn retry_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if let Some(a) = self.attempt.clone() {
             ui.add_space(12.0);
             ui.separator();
-            ui.strong(if self.busy { "Save in progress" } else { "Your save is ready to retry" });
+            ui.strong("Your save is ready to retry");
             ui.label(presentation::file_name(&a.name));
             if !self.busy {
                 ui.weak("Retry the captured file, or dismiss this attempt to save your current edits.");
@@ -197,10 +189,7 @@ impl Cloud {
         files.sort_by_key(|p| std::cmp::Reverse(p.revisions.last().map_or(p.created_at, |r| r.created_at)));
         if !files.iter().any(|p| !p.revisions.is_empty()) && !self.busy {
             ui.label("Your saved files will appear here.");
-            ui.weak("Save a document from the editor to get started.");
-            if ui.button("Save current file…").clicked() {
-                self.view = View::Save;
-            }
+            ui.weak("Use File → Save to Cloud in the editor to save your first file.");
         }
         egui::ScrollArea::vertical().id_salt("cloud_files").max_height(330.0).show(ui, |ui| {
             for p in files.iter().filter(|p| !p.revisions.is_empty()) {
@@ -230,7 +219,7 @@ impl Cloud {
             ui.add_space(12.0);
             ui.separator();
             ui.collapsing(format!("Unfinished saves ({})", unfinished.len()), |ui| {
-                ui.weak("These saves did not finish. They cannot be opened. Retry from Save file while the attempt is available, or discard them here.");
+                ui.weak("These saves did not finish. They cannot be opened. Retry below while the attempt is available, or discard them here.");
                 for p in unfinished {
                     ui.push_id(("unfinished", p.id), |ui| {
                         ui.strong(presentation::file_name(&p.name));

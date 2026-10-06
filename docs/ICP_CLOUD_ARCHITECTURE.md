@@ -45,19 +45,24 @@ not add identity or networking dependencies to the engine. Document edits still 
 existing command system. A future agent API needs a deliberate authorization boundary;
 the cloud panel is not an agent interface.
 
-**File → Save to Cloud…** opens the save view for an unlinked document and saves a new
-revision for an already linked file. **File → Open from Cloud…** opens **My files**.
+**File → Save to Cloud…** asks for a name on the first save and saves a new
+version of an already linked file when the document has changed. **File → Open from Cloud…** opens **My files**.
 The separate Sovereign Cloud window owns sign-in, file management and dated version history;
 ordinary File Save/Export stays local. Host requests are visible in menu inspection and
 explicitly reject automation until a capability model exists. They never replace built-in
 editor commands. The generic menu extension is kept in its own commit for upstream review.
 
-The cloud manager has a scoped blue/violet identity, a distinct **My files** library and a
-**Save file** view. The primary action saves a file or its changes; copying is a secondary
-**More…** action. Version history shows local date/time. Transfer progress and expiring activity
-notifications are separate from files; incomplete records appear only under **Unfinished saves**.
-Encoding captures the immutable document at click time and waits for a loading frame before
-running. Only the committed snapshot is marked saved; subsequent edits remain dirty.
+The cloud manager has a scoped blue/violet identity and a **My files** library. Saving starts
+only from the File menu. **Save to Cloud…** asks for a name once, then uploads changes directly;
+**Save a Copy to Cloud…** explicitly starts a new naming flow. Once uploading starts, the manager
+shows progress and files, with no second save button. Repeating Save to Cloud at the same local
+document revision does not create another version. The cloud snapshot revision is tracked
+separately from ordinary local downloads, so a local save cannot suppress a needed cloud save.
+
+Version history shows local date/time. Transfer progress and expiring activity notifications
+are separate from files; incomplete records appear only under **Unfinished saves**. Encoding
+captures the immutable document at click time and waits for a loading frame before running.
+Only the committed snapshot is marked saved; subsequent edits remain dirty.
 
 The public protocol still calls its single-file record `Project`. That internal name is kept
 for Candid and stable-memory compatibility; it is not a workspace or folder. Actual projects,

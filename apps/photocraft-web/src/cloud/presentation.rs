@@ -59,8 +59,7 @@ pub fn header(ui: &mut egui::Ui) {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SaveAction {
     Save,
-    Copy,
-    CancelCopy,
+    Cancel,
 }
 
 pub fn file_name(name: &str) -> String {
@@ -71,55 +70,26 @@ pub fn size_label(bytes: u64) -> String {
     if bytes >= 1024 * 1024 { format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0)) } else { format!("{} KiB", bytes.div_ceil(1024)) }
 }
 
-pub fn save_form(ui: &mut egui::Ui, name: &mut String, linked: Option<(&str, &str)>, copy: bool, enabled: bool) -> Option<SaveAction> {
+/// First-save/copy naming dialog, invoked only by a File-menu request.
+pub fn save_form(ui: &mut egui::Ui, name: &mut String, copy: bool, enabled: bool) -> Option<SaveAction> {
     let mut action = None;
     ui.add_enabled_ui(enabled, |ui| {
-        if copy {
-            ui.heading("Save a copy");
-            ui.weak("Your existing cloud file stays unchanged.");
-        } else if let Some((name, saved)) = linked {
-            ui.heading(file_name(name));
-            if !saved.is_empty() {
-                ui.weak(format!("Last saved {saved}"));
-            }
-            ui.add_space(6.0);
-            ui.label("Save your changes as a new version of this file.");
-        } else {
-            ui.heading("Save to Cloud");
-            ui.weak("Keep this file in your personal cloud storage.");
-        }
+        ui.heading(if copy { "Save a copy to Cloud" } else { "Save to Cloud" });
+        ui.weak(if copy { "Give the new copy a name." } else { "Name this file for your cloud storage." });
         ui.add_space(14.0);
-        if linked.is_none() || copy {
-            ui.label("File name");
-            ui.add(egui::TextEdit::singleline(name).hint_text("Untitled").desired_width(f32::INFINITY));
-            if name.trim().len() > 160 {
-                ui.colored_label(palette(ui.ctx()).warning, "Choose a shorter file name (160 bytes maximum).");
-            }
-            ui.add_space(12.0);
+        ui.label("File name");
+        ui.add(egui::TextEdit::singleline(name).hint_text("Untitled").desired_width(f32::INFINITY));
+        if name.trim().len() > 160 {
+            ui.colored_label(palette(ui.ctx()).warning, "Choose a shorter file name (160 bytes maximum).");
         }
-        let label = if copy {
-            "Save copy"
-        } else if linked.is_some() {
-            "Save changes"
-        } else {
-            "Save file"
-        };
-        let valid = (linked.is_some() && !copy) || (!name.trim().is_empty() && name.trim().len() <= 160);
+        ui.add_space(12.0);
+        let valid = !name.trim().is_empty() && name.trim().len() <= 160;
         ui.horizontal(|ui| {
-            if ui.add_enabled_ui(valid, |ui| primary(ui, label)).inner.clicked() {
+            if ui.add_enabled_ui(valid, |ui| primary(ui, if copy { "Save copy" } else { "Save" })).inner.clicked() {
                 action = Some(SaveAction::Save);
             }
-            if copy {
-                if ui.button("Cancel").clicked() {
-                    action = Some(SaveAction::CancelCopy);
-                }
-            } else if linked.is_some() {
-                ui.menu_button("More…", |ui| {
-                    if ui.button("Save a copy…").clicked() {
-                        action = Some(SaveAction::Copy);
-                        ui.close();
-                    }
-                });
+            if ui.button("Cancel").clicked() {
+                action = Some(SaveAction::Cancel);
             }
         });
     });
@@ -198,29 +168,23 @@ mod tests {
     use photocraft_ui_egui::PhotocraftApp;
 
     #[test]
-    fn linked_save_hides_naming_and_copy_until_requested() {
-        let mut h = Harness::builder().with_size(egui::vec2(460.0, 280.0)).build_ui_state(
-            |ui, state: &mut (String, bool, Option<SaveAction>)| {
-                if let Some(a) = save_form(ui, &mut state.0, Some(("Poster", "07/10/2026, 01:25:00")), state.1, true) {
-                    state.2 = Some(a);
-                    if a == SaveAction::Copy {
-                        state.1 = true;
+    fn naming_dialog_confirms_once_and_can_be_cancelled() {
+        for copy in [false, true] {
+            let mut h = Harness::builder().with_size(egui::vec2(460.0, 280.0)).build_ui_state(
+                |ui, action: &mut Option<SaveAction>| {
+                    if let Some(a) = save_form(ui, &mut "Poster".to_string(), copy, true) {
+                        *action = Some(a);
                     }
-                }
-            },
-            ("Poster copy".into(), false, None),
-        );
-        h.run_steps(3);
-        assert!(h.query_by_label("File name").is_none());
-        assert!(h.query_by_label("Save copy").is_none());
-        h.get_by_label("More…").click();
-        h.run_steps(3);
-        h.get_by_label("Save a copy…").click();
-        h.run_steps(3);
-        assert!(h.query_by_label("File name").is_some());
-        h.get_by_label("Save copy").click();
-        h.run_steps(3);
-        assert_eq!(h.state().2, Some(SaveAction::Save));
+                },
+                None,
+            );
+            h.get_by_label(if copy { "Save copy" } else { "Save" }).click();
+            h.run_steps(3);
+            assert_eq!(*h.state(), Some(SaveAction::Save));
+            h.get_by_label("Cancel").click();
+            h.run_steps(3);
+            assert_eq!(*h.state(), Some(SaveAction::Cancel));
+        }
     }
 
     #[test]
@@ -228,11 +192,11 @@ mod tests {
         for (name, enabled) in [("Poster", false), ("   ", true), (&"a".repeat(161), true)] {
             let mut h = Harness::builder().build_ui_state(
                 |ui, action: &mut Option<SaveAction>| {
-                    *action = save_form(ui, &mut name.to_string(), None, false, enabled);
+                    *action = save_form(ui, &mut name.to_string(), false, enabled);
                 },
                 None,
             );
-            h.get_by_label("Save file").click();
+            h.get_by_label("Save").click();
             h.run_steps(3);
             assert!(h.state().is_none());
         }
@@ -250,12 +214,6 @@ mod tests {
                         style(ui);
                         header(ui);
                         ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.selectable_label(view == "files", "My files").clicked();
-                            ui.selectable_label(view != "files", "Save file").clicked();
-                        });
-                        ui.separator();
-                        ui.add_space(8.0);
                         section(ui).show(ui, |ui| {
                             if view == "files" {
                                 ui.heading("My files");
@@ -266,7 +224,8 @@ mod tests {
                                 ui.label("Version history");
                                 revision_row(ui, "07/10/2026, 01:25:00", 3 * 1024 * 1024, true);
                             } else {
-                                save_form(ui, &mut "Poster".to_string(), Some(("Poster", "07/10/2026, 01:25:00")), false, false);
+                                ui.heading("My files");
+                                ui.weak("Your saved files will appear here.");
                             }
                         });
                         ui.add_space(12.0);
@@ -282,7 +241,8 @@ mod tests {
                         assert!(h.query_by_label("Open file").is_some());
                         assert!(h.query_by_label("07/10/2026, 01:25:00").is_some());
                     } else {
-                        assert!(h.query_by_label("Save changes").is_some());
+                        assert!(h.query_by_label("Save").is_none());
+                        assert!(h.query_by_label("Save file").is_none());
                     }
                     if let Some(dir) = &output {
                         h.render().unwrap().save(format!("{dir}/cloud-{view}-{index}-{width}.png")).unwrap();
