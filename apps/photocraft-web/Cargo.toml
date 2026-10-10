@@ -8,6 +8,9 @@ publish = false
 
 [features]
 icp-cloud = ["dep:sovereign-cloud-ui"]
+# Open HEIC/HEIF photos (the optional photocraft-heif crate). Not default so distributors choose
+# it; official builds (CI, packaging/, release) build with `--features heif`.
+heif = ["photocraft-codecs/heif"]
 
 [lints]
 workspace = true
@@ -25,9 +28,6 @@ photocraft-ui-egui = { workspace = true }
 egui = { workspace = true }
 log = { workspace = true }
 
-[dev-dependencies]
-egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
-
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 sovereign-cloud-ui = { path = "../../vendor/sovereign-cloud-ui", optional = true }
 # `wgpu` pulls egui-wgpu's defaults: WebGPU plus the WebGL2 fallback.
@@ -36,4 +36,10 @@ rfd = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Document", "HtmlDocument", "Element", "HtmlElement", "HtmlCanvasElement", "HtmlAnchorElement", "Blob", "BlobPropertyBag", "Url", "Location", "CssStyleDeclaration", "Storage", "Event", "EventTarget", "MouseEvent", "PointerEvent"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlDocument", "Element", "HtmlElement", "HtmlCanvasElement", "HtmlAnchorElement", "Blob", "BlobPropertyBag", "Url", "Location", "CssStyleDeclaration", "Storage", "Event", "EventTarget", "MouseEvent", "PointerEvent", "BeforeUnloadEvent", "AbortController", "AbortSignal", "DomException", "Response", "IdbFactory", "IdbOpenDbRequest", "IdbDatabase", "IdbRequest", "IdbTransaction", "IdbTransactionMode", "IdbObjectStore", "IdbCursor", "IdbCursorWithValue", "RequestInit", "Navigator"] }
+
+[dev-dependencies]
+egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
+serde_json = { workspace = true }
+photocraft-paint = { workspace = true }
+photocraft-psd = { workspace = true }

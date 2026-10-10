@@ -23,8 +23,29 @@ use parley::{
 };
 use photocraft_doc::TextLayer;
 use photocraft_doc::text::{Caps, CharStyle, Kerning, Orientation, TextAlign, TextDirection, TextShape};
+use skrifa::raw::types::Tag;
 
 use crate::fonts::FontDb;
+
+/// Photoshop synthesizes small caps for faces without an OpenType `smcp` table. Keep the same
+/// readable hierarchy for every font instead of silently rendering lowercase text unchanged.
+const SYNTHETIC_SMALL_CAPS_SCALE: f32 = 0.7;
+
+/// The rendering path for a `SmallCaps` character style.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SmallCapsMode {
+    None,
+    OpenType,
+    Synthetic,
+}
+
+fn small_caps_mode(caps: Caps, face_has_smcp: bool) -> SmallCapsMode {
+    match caps {
+        Caps::SmallCaps if face_has_smcp => SmallCapsMode::OpenType,
+        Caps::SmallCaps => SmallCapsMode::Synthetic,
+        _ => SmallCapsMode::None,
+    }
+}
 
 /// Index of the character run whose style a glyph uses, plus the vertical-type class of its
 /// characters ([`VClass`] as `u8`; always 0 in horizontal type).
@@ -272,8 +293,94 @@ impl TextLayout {
     }
 }
 
+/// Byte offset of character `index` (the text length when `index` is past the end).
+pub fn byte_index(text: &str, index: usize) -> usize {
+    text.char_indices().nth(index).map_or(text.len(), |(b, _)| b)
+}
+
+/// Character index of byte `byte`, floored to a char boundary so a bad offset never panics.
+pub fn char_index(text: &str, byte: usize) -> usize {
+    let mut byte = byte.min(text.len());
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    text[..byte].chars().count()
+}
+
+/// Line containing a byte offset (the last line when the offset sits past every line).
+pub fn line_index(layout: &TextLayout, byte: usize) -> usize {
+    layout.lines.iter().position(|ln| byte >= ln.range.start && byte <= ln.range.end).unwrap_or_else(|| layout.lines.len().saturating_sub(1))
+}
+
+/// Nearest caret to a text-space point: character index and the line it sits on.
+pub fn hit_char(layout: &TextLayout, text: &str, x: f32, y: f32) -> (usize, usize) {
+    let byte = layout.hit_test(x, y);
+    (char_index(text, byte), line_index(layout, byte))
+}
+
+/// Text-space point inside the laid-out line boxes, expanded by `slop` px on every side.
+pub fn text_point_inside(layout: &TextLayout, x: f32, y: f32, slop: f32) -> bool {
+    let slop = if slop.is_finite() { slop.max(0.0) } else { 0.0 };
+    layout.bounds().is_some_and(|b| x >= b[0] - slop && x <= b[2] + slop && y >= b[1] - slop && y <= b[3] + slop)
+}
+
+/// Character index of the word boundary before (`forward` is false) or after `idx`.
+///
+/// A word is a run of alphanumeric characters, the rule the Type tool has always used.
+pub fn word_boundary(text: &str, idx: usize, forward: bool) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = idx.min(chars.len());
+    if forward {
+        while i < chars.len() && !chars[i].is_alphanumeric() {
+            i += 1;
+        }
+        while i < chars.len() && chars[i].is_alphanumeric() {
+            i += 1;
+        }
+    } else {
+        while i > 0 && !chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        while i > 0 && chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+    }
+    i
+}
+
+/// Caret on the neighbouring line (`dir` < 0 previous, otherwise next), keeping `x`
+/// (line space: the position along the line). Past the first or last line the caret
+/// goes to the start or end of the text. Line space is the same for both orientations,
+/// so a column of vertical type steps the same way a line of horizontal type does.
+pub fn line_step(layout: &TextLayout, text: &str, idx: usize, x: f32, dir: i32) -> usize {
+    let n = text.chars().count();
+    let idx = idx.min(n);
+    let (_, top, bottom) = layout.caret(byte_index(text, idx));
+    let h = (bottom - top).max(1.0);
+    let y = if dir < 0 { top - h * 0.5 } else { bottom + h * 0.5 };
+    let Some(bounds) = layout.line_bounds() else { return idx };
+    if y < bounds[1] {
+        return 0;
+    }
+    if y > bounds[3] {
+        return n;
+    }
+    char_index(text, layout.hit_test_line(x, y))
+}
+
+/// Line start (`end` false) or end for the line containing `idx`, as a character index.
+pub fn line_edge(layout: &TextLayout, text: &str, idx: usize, end: bool) -> usize {
+    let n = text.chars().count();
+    let idx = idx.min(n);
+    let byte = byte_index(text, idx);
+    let line = layout.lines.iter().find(|ln| byte >= ln.range.start && byte <= ln.range.end).or(layout.lines.last());
+    line.map_or(idx, |ln| char_index(text, if end { ln.range.end } else { ln.range.start }))
+}
+
 const LRM: &str = "\u{200E}";
 const RLM: &str = "\u{200F}";
+/// A line break inside a paragraph (Shift+Return), stored as U+0003 in PSD type.
+pub(crate) const FORCED_LINE_BREAK: char = '\u{3}';
 
 pub(crate) struct Layouter {
     lcx: LayoutContext<RunBrush>,
@@ -311,7 +418,9 @@ impl Layouter {
         // Resolve families (PostScript names from PSDs, unknown families).
         for r in &runs {
             let mut s = r.style.clone();
-            if let Some(ps) = s.postscript_name.clone() {
+            if let Some(ps) = s.postscript_name.clone()
+                && !fonts.faces(&s.font_family).iter().any(|f| f.postscript_name.as_deref() == Some(&ps))
+            {
                 let f = fonts.resolve_postscript(&ps);
                 // An exact face match wins; a guessed family only fills a missing family.
                 if f.exact || (!fonts.has_family(&s.font_family) && fonts.has_family(&f.family)) {
@@ -320,6 +429,11 @@ impl Layouter {
                     s.italic = f.italic;
                 }
             }
+            // Drawn with a fallback for now; a host that serves this family fetches it (`served`).
+            if !fonts.has_family(&s.font_family) {
+                crate::served::request(&s.font_family);
+            }
+            fonts.select_named_face(&mut s);
             out.styles.push(s);
         }
         let run_starts: Vec<usize> = runs
@@ -363,12 +477,41 @@ impl Layouter {
             };
             let mut ptext = String::with_capacity(prefix.len() + content.len());
             ptext.push_str(prefix);
+            // A real `smcp` substitution must receive lowercase source text; only the fallback
+            // path uppercases it and scales it down.
+            let small_caps: Vec<SmallCapsMode> = out
+                .styles
+                .iter()
+                .map(|style| small_caps_mode(style.caps, fonts.selected_face_has_feature(&style.font_family, style.weight, style.italic, Tag::new(b"smcp"))))
+                .collect();
+            // Ranges in `ptext` for lowercase characters rendered as synthetic small caps.
+            // They have the same UTF-8 length as their uppercase form, so the layer's byte-based
+            // run and caret offsets remain unchanged.
+            let mut synthetic_small_caps: Vec<(Range<usize>, f32)> = Vec::new();
             for (i, ch) in content.char_indices() {
-                let caps = out.styles[style_at(prange.start + i)].caps;
-                if caps == Caps::AllCaps {
+                // A forced line break ends the line but not the paragraph. The line breaker knows
+                // it as a newline, which has the same length, so text offsets don't move.
+                if ch == FORCED_LINE_BREAK {
+                    ptext.push('\n');
+                    continue;
+                }
+                // Imported PSD text can contain literal tab controls. Font shaping may
+                // render those as .notdef boxes; a space preserves the one-byte source
+                // and style/caret offsets while supplying a real whitespace advance.
+                if ch == '\t' {
+                    ptext.push(' ');
+                    continue;
+                }
+                let style = &out.styles[style_at(prange.start + i)];
+                let caps = style.caps;
+                if caps == Caps::AllCaps || small_caps[style_at(prange.start + i)] == SmallCapsMode::Synthetic {
                     let up: String = ch.to_uppercase().collect();
                     if up.len() == ch.len_utf8() {
                         ptext.push_str(&up);
+                        if caps == Caps::SmallCaps && ch.is_lowercase() {
+                            let end = ptext.len();
+                            synthetic_small_caps.push((end - up.len()..end, style.size_pt * k * SYNTHETIC_SMALL_CAPS_SCALE));
+                        }
                         continue;
                     }
                 }
@@ -376,13 +519,16 @@ impl Layouter {
             }
             let first_style = &out.styles[style_at(prange.start)];
             let first_px = first_style.size_pt * k;
+            // Scripts the loaded fonts may lack (Arabic, Japanese, …): a host serving a font for them
+            // fetches it (`served`); it joins the fallback stack once it arrives.
+            crate::served::request_for_text(&ptext);
             let fallback: Vec<String> = fonts.fallback_stack().map(str::to_string).collect();
             let mut layout: Layout<RunBrush> = {
                 let mut b = self.lcx.ranged_builder(&mut fonts.fcx, &ptext, 1.0, false);
                 // Paragraph-start style as the default (covers the direction mark and empty
                 // paragraphs), then every run piece intersecting this paragraph.
                 let si0 = style_at(prange.start);
-                for p in style_props(&out.styles[si0], k, &fallback, si0 as u32) {
+                for p in style_props(&out.styles[si0], k, &fallback, si0 as u32, small_caps[si0]) {
                     b.push_default(p);
                 }
                 for (ri, st) in out.styles.iter().enumerate() {
@@ -392,7 +538,7 @@ impl Layouter {
                         continue;
                     }
                     let range = (a - prange.start + prefix.len())..(z - prange.start + prefix.len());
-                    for p in style_props(st, k, &fallback, ri as u32) {
+                    for p in style_props(st, k, &fallback, ri as u32, small_caps[ri]) {
                         b.push(p, range.clone());
                     }
                     if vertical {
@@ -403,7 +549,7 @@ impl Layouter {
                             if cls == VClass::Rotate || from >= to {
                                 return;
                             }
-                            let mut feats = feature_list(st);
+                            let mut feats = feature_list(st, small_caps[ri]);
                             feats.push("\"vert\" 1".into());
                             let r = (range.start + from)..(range.start + to);
                             b.push(StyleProperty::FontFeatures(FontFeatures::Source(Cow::Owned(feats.join(", ")))), r.clone());
@@ -424,6 +570,9 @@ impl Layouter {
                             flush(&mut b, from, piece.len(), c);
                         }
                     }
+                }
+                for (range, size) in synthetic_small_caps {
+                    b.push(StyleProperty::FontSize(size), range);
                 }
                 b.build(&ptext)
             };
@@ -922,7 +1071,7 @@ impl skrifa::outline::OutlinePen for YMax {
 }
 
 /// OpenType feature settings of a character style (CSS `font-feature-settings` items).
-fn feature_list(st: &CharStyle) -> Vec<String> {
+fn feature_list(st: &CharStyle, small_caps: SmallCapsMode) -> Vec<String> {
     let mut feats: Vec<String> = Vec::new();
     // Optical and manual kerning replace the font's kerning table; a character with a manual
     // kern is manually kerned whatever its mode (as in Photoshop).
@@ -936,7 +1085,7 @@ fn feature_list(st: &CharStyle) -> Vec<String> {
     if st.discretionary_ligatures {
         feats.push("\"dlig\" 1".into());
     }
-    if st.caps == Caps::SmallCaps {
+    if small_caps == SmallCapsMode::OpenType {
         feats.push("\"smcp\" 1".into());
     }
     for f in &st.features {
@@ -947,15 +1096,20 @@ fn feature_list(st: &CharStyle) -> Vec<String> {
     feats
 }
 
-fn style_props(st: &CharStyle, k: f32, fallback: &[String], idx: u32) -> Vec<StyleProperty<'static, RunBrush>> {
+fn style_props(st: &CharStyle, k: f32, fallback: &[String], idx: u32, small_caps: SmallCapsMode) -> Vec<StyleProperty<'static, RunBrush>> {
     let px = (st.size_pt * k).max(0.01);
     let mut fam: Vec<String> = Vec::new();
     if !st.font_family.is_empty() {
         fam.push(quote(&st.font_family));
     }
-    fam.extend(fallback.iter().map(|f| quote(f)));
+    // Serif runs fall back to a Mincho face for Japanese (craft-fonts), others to a Gothic one.
+    if crate::craft_fonts::is_serif_family(&st.font_family) {
+        fam.extend(crate::craft_fonts::mincho_first(fallback).iter().map(|f| quote(f)));
+    } else {
+        fam.extend(fallback.iter().map(|f| quote(f)));
+    }
     fam.push("sans-serif".into());
-    let feats = feature_list(st);
+    let feats = feature_list(st, small_caps);
     let vars: Vec<String> = st.variations.iter().filter(|v| v.axis.len() == 4 && v.axis.is_ascii()).map(|v| format!("\"{}\" {}", v.axis, v.value)).collect();
     vec![
         StyleProperty::FontFamily(FontFamily::Source(Cow::Owned(fam.join(", ")))),
@@ -1056,4 +1210,22 @@ fn first_ascent(line: &parley::Line<'_, RunBrush>) -> Option<f32> {
         }
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SmallCapsMode, feature_list, small_caps_mode};
+    use photocraft_doc::text::{Caps, CharStyle};
+
+    #[test]
+    fn uses_real_small_caps_only_when_the_selected_face_supports_smcp() {
+        let style = CharStyle { caps: Caps::SmallCaps, ..Default::default() };
+        let real = small_caps_mode(style.caps, true);
+        let synthetic = small_caps_mode(style.caps, false);
+
+        assert_eq!(real, SmallCapsMode::OpenType);
+        assert!(feature_list(&style, real).iter().any(|feature| feature == "\"smcp\" 1"));
+        assert_eq!(synthetic, SmallCapsMode::Synthetic);
+        assert!(!feature_list(&style, synthetic).iter().any(|feature| feature == "\"smcp\" 1"));
+    }
 }

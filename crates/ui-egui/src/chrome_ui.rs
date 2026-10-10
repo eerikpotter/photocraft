@@ -101,10 +101,22 @@ pub fn status_info_text(doc: &Document, key: &str, tool: &str, profile: &str) ->
 }
 
 fn profile_name(doc: &Document) -> String {
-    if doc.icc_profile.is_none() {
-        return crate::i18n::fmt(tl!("Untagged {mode}"), &[("mode", tl!(&crate::canvas::mode_label(doc)))]);
+    let mode = crate::canvas::mode_label(doc);
+    let Some(bytes) = doc.icc_profile.as_ref() else {
+        return crate::i18n::fmt(tl!("Untagged {mode}"), &[("mode", tl!(mode))]);
+    };
+    let Ok(profile) = photocraft_engine::color_cmds::profile_from_bytes(bytes) else {
+        return crate::i18n::fmt(tl!("Invalid {mode} profile"), &[("mode", tl!(mode))]);
+    };
+    if profile.color_space != photocraft_engine::color_cmds::mode_space(doc.mode) {
+        return crate::i18n::fmt(tl!("Invalid {mode} profile"), &[("mode", tl!(mode))]);
     }
-    photocraft_engine::color_cmds::document_profile(doc).description.clone()
+    let name: String = profile.description.chars().filter(|c| !c.is_control()).take(128).collect();
+    let name = name.trim();
+    if name.is_empty() {
+        return crate::i18n::fmt(tl!("Unnamed {mode} profile"), &[("mode", tl!(mode))]);
+    }
+    name.to_owned()
 }
 
 /// Status bar body (Pro): zoom %, the chosen info field and its ">" menu, then status messages.
@@ -112,12 +124,14 @@ pub fn status_bar_pro(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let (Some(st), Some(i)) = (app.session.active(), app.session.active_index()) else {
         ui.label(RichText::new(tl!("No document")).color(t.text_dim));
+        // A command run with no document open still reports here (#1567: File › Automate › Batch).
+        status_message(app, ui, &t);
         return;
     };
     let text = status_info_text(&st.doc, &app.ui.chrome.status_info, tl!(app.ui.tool.label()), &profile_name(&st.doc));
     let mut pct = app.ui.views[i].zoom * 100.0;
-    if widgets::value_field(ui, &mut pct, 1.0..=3200.0, "%", 64.0).changed() {
-        app.ui.views[i].zoom = pct / 100.0;
+    if widgets::value_field(ui, &mut pct, crate::zoom_levels::percent_range(&app.ui.views[i]), "%", 64.0).changed() {
+        app.ui.views[i].zoom = crate::zoom_levels::clamp(pct / 100.0, app.ui.views[i].doc_size);
         app.ui.views[i].fit_pending = false;
     }
     ui.add_space(12.0);
@@ -138,12 +152,18 @@ pub fn status_bar_pro(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             }
         }
     });
-    if !app.ui.status.is_empty() {
-        let (r, _) = ui.allocate_exact_size(vec2(17.0, 16.0), Sense::hover());
-        ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, t.separator));
-        let is_err = app.ui.status_error || app.ui.status.starts_with("Couldn");
-        ui.label(RichText::new(&app.ui.status).color(if is_err { t.warning } else { t.text_faint }));
+    status_message(app, ui, &t);
+}
+
+/// The latest status message after a separator, in the warning colour when it is an error.
+fn status_message(app: &PhotocraftApp, ui: &mut egui::Ui, t: &Tokens) {
+    if app.ui.status.is_empty() {
+        return;
     }
+    let (r, _) = ui.allocate_exact_size(vec2(17.0, 16.0), Sense::hover());
+    ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, t.separator));
+    let is_err = app.ui.status_error || app.ui.status.starts_with("Couldn");
+    ui.label(RichText::new(&app.ui.status).color(if is_err { t.warning } else { t.text_faint }));
 }
 
 /// Home button at the very start of Photoshop 2026's options bar: toggles the Home (start)
@@ -196,7 +216,7 @@ pub fn crop_ratio(key: &str, doc_w: f64, doc_h: f64) -> Option<(f64, f64)> {
         return Some((doc_w, doc_h));
     }
     let (a, b) = key.split_once(':')?;
-    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    Some((crate::numeric_expression::parse(a)?, crate::numeric_expression::parse(b)?))
 }
 
 #[cfg(test)]
@@ -218,6 +238,47 @@ mod tests {
         assert_eq!(status_info_text(&d, "layers", "", ""), "1 Layer");
         assert_eq!(status_info_text(&d, "tool", "Brush Tool", ""), "Brush Tool");
         assert!(status_info_text(&d, "profile", "", "sRGB IEC61966-2.1").ends_with("(8bpc)"));
+    }
+
+    #[test]
+    fn status_profile_describes_rgb_gray_and_custom_profiles_without_mutating_the_document() {
+        let mut rgb = doc();
+        rgb.icc_profile = Some(photocraft_engine::color_cmds::working_profile(rgb.mode).to_bytes());
+        let before = rgb.icc_profile.clone();
+        assert_eq!(profile_name(&rgb), "sRGB IEC61966-2.1");
+        assert_eq!(status_info_text(&rgb, "profile", "", &profile_name(&rgb)), "sRGB IEC61966-2.1 (8bpc)");
+        assert_eq!(rgb.icc_profile, before);
+
+        let mut gray = doc();
+        gray.mode = photocraft_doc::ColorMode::Grayscale;
+        gray.icc_profile = Some(photocraft_engine::color_cmds::working_profile(gray.mode).to_bytes());
+        assert_eq!(profile_name(&gray), "sGray (sRGB tone curve, Photocraft)");
+
+        let mut custom = (*photocraft_engine::color_cmds::working_profile(photocraft_doc::ColorMode::Cmyk)).clone();
+        custom.description = "PhotoCraft Studio CMYK".into();
+        let mut custom_doc = doc();
+        custom_doc.mode = photocraft_doc::ColorMode::Cmyk;
+        custom_doc.icc_profile = Some(custom.with_encoded_bytes().to_bytes());
+        assert_eq!(profile_name(&custom_doc), "PhotoCraft Studio CMYK");
+    }
+
+    #[test]
+    fn status_profile_falls_back_for_malformed_unnamed_and_mismatched_profiles() {
+        let mut malformed = doc();
+        malformed.icc_profile = Some(std::sync::Arc::new(vec![1, 2, 3]));
+        assert_eq!(profile_name(&malformed), "Invalid RGB profile");
+
+        let mut unnamed_profile = (*photocraft_engine::color_cmds::working_profile(photocraft_doc::ColorMode::Cmyk)).clone();
+        unnamed_profile.description.clear();
+        let mut unnamed = doc();
+        unnamed.mode = photocraft_doc::ColorMode::Cmyk;
+        unnamed.icc_profile = Some(unnamed_profile.with_encoded_bytes().to_bytes());
+        assert_eq!(profile_name(&unnamed), "Unnamed CMYK profile");
+
+        let mut mismatched = doc();
+        mismatched.mode = photocraft_doc::ColorMode::Grayscale;
+        mismatched.icc_profile = Some(photocraft_engine::color_cmds::working_profile(photocraft_doc::ColorMode::Rgb).to_bytes());
+        assert_eq!(profile_name(&mismatched), "Invalid Gray profile");
     }
 
     #[test]
@@ -262,6 +323,21 @@ mod tests {
         assert_eq!(crop_ratio("", 1.0, 1.0), None);
         let (w, h) = crop_ratio("1:1", 0.0, 0.0).unwrap();
         assert_eq!(marquee_end("fixedRatio", w, h, false, [0.0, 0.0], [50.0, 20.0]), [50.0, 50.0]);
+    }
+
+    #[test]
+    fn status_message_shows_with_no_document_open() {
+        // #1567: File › Automate › Batch with no recorded action and no document answered nothing.
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.session.actions.list.clear();
+        let e = crate::menus::invoke(&mut app, &egui::Context::default(), "file.automate.batch", json!({})).unwrap_err();
+        app.ui.status = e.clone();
+        app.ui.status_error = true;
+        let mut h = Harness::builder().with_size(vec2(900.0, 40.0)).build_ui_state(|ui, app| status_bar_pro(app, ui), app);
+        h.run_steps(2);
+        assert!(h.query_by_label("No document").is_some());
+        assert!(h.query_by_label(&e).is_some(), "status bar shows {e:?}");
     }
 
     #[test]

@@ -166,6 +166,7 @@ pub fn rich_doc(mode: ColorMode, depth: SampleType) -> Document {
     let smart = Layer::new(
         "Smart",
         LayerContent::Smart(SmartObject {
+            contents_id: SmartContentsId::fresh(),
             source: SmartSource::Embedded { file_name: "inner.png".into(), bytes: blob(11, 2000) },
             transform: Affine::scale(0.5),
             smart_filters: vec![SmartFilter {
@@ -187,11 +188,14 @@ pub fn rich_doc(mode: ColorMode, depth: SampleType) -> Document {
             }),
             warp: Some(photocraft_geom::warp::Warp::custom(photocraft_geom::warp::BezierMesh::identity([0.0, 0.0, 48.0, 24.0], 2, 1), [0.0, 0.0, 48.0, 24.0])),
             stack_mode: Some(photocraft_doc::StackMode::Median),
+            // Distort / Perspective placement, so the round trip covers it.
+            perspective: Some([1.0, 0.1, 2.0, 0.05, 1.0, 3.0, 0.001, 0.0005, 1.0]),
         }),
     );
     let linked = Layer::new(
         "Linked",
         LayerContent::Smart(SmartObject {
+            contents_id: SmartContentsId::fresh(),
             source: SmartSource::Linked { path: "/tmp/linked.psd".into() },
             transform: Affine::IDENTITY,
             smart_filters: vec![],
@@ -201,6 +205,7 @@ pub fn rich_doc(mode: ColorMode, depth: SampleType) -> Document {
             filter_mask: None,
             warp: None,
             stack_mode: None,
+            perspective: None,
         }),
     );
     d.layers.extend([paint, group, fill, grad, text, shape, smart, linked]);
@@ -227,6 +232,7 @@ pub fn rich_doc(mode: ColorMode, depth: SampleType) -> Document {
     scribble(&mut sel, 14, false);
     d.selection = Some(sel);
     d.metadata.xmp = Some("<x:xmpmeta/>".into());
+    d.metadata.text = vec![("Author".into(), "Synthetic é 雪".into()), ("Comment".into(), "first".into()), ("Comment".into(), "second".into())];
     d.metadata.exif = Some(blob(15, 64));
     d.metadata.psd_resources.push((1036, "thumb".into(), blob(16, 20)));
     d.metadata.psd_global_blocks.push((*b"8BIM", *b"Patt", blob(17, 50)));

@@ -23,6 +23,7 @@ mod artistic_fx;
 mod blur;
 mod blur2;
 pub mod camera_raw;
+pub mod color_to_alpha;
 pub mod content_aware;
 mod denoise;
 mod distort;
@@ -33,12 +34,15 @@ pub mod features;
 mod fxutil;
 mod gallery;
 pub mod hdr;
+pub mod histogram;
 mod image;
 pub mod inpaint;
 pub mod lens;
 pub mod liquify;
+pub mod magnetic;
 pub mod matting;
 mod noise;
+pub mod nonlocal;
 mod oil;
 mod other;
 mod other2;
@@ -51,6 +55,9 @@ pub mod poisson;
 pub mod puppet;
 pub mod pyramid;
 pub mod quantize;
+pub mod redeye;
+mod relight;
+pub mod remove;
 mod render;
 pub mod render2;
 pub mod resample;
@@ -60,6 +67,7 @@ pub mod seam;
 pub mod segment;
 pub mod selection;
 mod selection_blur;
+mod shape_blur;
 mod sharpen;
 pub mod stack;
 mod stylize;
@@ -68,6 +76,7 @@ pub mod tone;
 pub mod transform;
 pub mod trap;
 pub mod vanishing;
+pub mod vectorscope;
 mod video;
 pub mod warp;
 pub mod wideangle;
@@ -99,6 +108,19 @@ pub enum RadialMethod {
     #[default]
     Spin,
     Zoom,
+}
+
+/// Sampling quality for radial blur. Higher quality improves large-radius detail at greater cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum RadialQuality {
+    /// Up to 64 intervals per pixel for a faster, coarser result.
+    Draft,
+    /// Up to 256 intervals per pixel; the default.
+    #[default]
+    Good,
+    /// Up to 4096 intervals per pixel.
+    Best,
 }
 
 /// Noise distribution.
@@ -191,6 +213,8 @@ pub enum FilterParams {
     RadialBlur {
         amount: f32,
         method: RadialMethod,
+        #[serde(default)]
+        quality: RadialQuality,
         center_x: f32,
         center_y: f32,
     },
@@ -409,6 +433,16 @@ pub enum FilterParams {
         height: f32,
         white_is_high: bool,
     },
+    /// Photographic relight: angle −180…180°, elevation 0…90°, intensity/ambient 0…100,
+    /// warmth −100…100, softness 1…100. Intensity 0 is an identity copy.
+    Relight {
+        angle: f32,
+        elevation: f32,
+        intensity: f32,
+        ambient: f32,
+        warmth: f32,
+        softness: f32,
+    },
 
     // ---- Noise ----
     /// Strength 0–10, the rest 0–100 %.
@@ -488,6 +522,14 @@ pub enum FilterParams {
         input: HsbModel,
         output: HsbModel,
     },
+    /// Removes `color` (straight sRGB RGBA, alpha ignored) by unmixing it from every pixel into
+    /// transparency (see [`color_to_alpha`]). Thresholds 0–1: opacities at or below
+    /// `transparency_threshold` become 0, at or above `opacity_threshold` 1, linear in between.
+    ColorToAlpha {
+        color: [f32; 4],
+        transparency_threshold: f32,
+        opacity_threshold: f32,
+    },
 
     // ---- Video ----
     /// Removes the even (or odd) lines and rebuilds them by interpolation (or duplication).
@@ -530,6 +572,22 @@ impl FilterParams {
             | FilterParams::PolarCoordinates { .. } => Halo::Bounds,
             other => halo_ext(other),
         }
+    }
+
+    /// [`Self::halo`] using the document/selection bounds so filters whose reach
+    /// depends on size (Relight's shading blur) request the neighbourhood they actually read.
+    pub fn halo_for(&self, bounds: Rect) -> Halo {
+        match self {
+            FilterParams::Relight { intensity, softness, .. } if *intensity != 0.0 => Halo::Radius(relight::halo_radius(*softness, bounds)),
+            _ => self.halo(),
+        }
+    }
+
+    /// Whether the filter's job is to make pixels transparent (Color to Alpha): it needs a layer
+    /// that can hold transparency, so callers turn the Background into a normal layer first and
+    /// refuse a layer whose transparency is locked instead of putting the old alpha back.
+    pub fn makes_transparency(&self) -> bool {
+        matches!(self, FilterParams::ColorToAlpha { .. })
     }
 
     /// Whether the filter moves pixels around the reference bounds (its
@@ -585,6 +643,7 @@ impl FilterParams {
             FilterParams::Fibers { .. } => "Fibers",
             FilterParams::LensFlare { .. } => "Lens Flare",
             FilterParams::LightingEffects { .. } => "Lighting Effects",
+            FilterParams::Relight { .. } => "Relight",
             FilterParams::ReduceNoise { .. } => "Reduce Noise",
             FilterParams::SmartBlur { .. } => "Smart Blur",
             FilterParams::LensBlur { .. } => "Lens Blur",
@@ -596,6 +655,7 @@ impl FilterParams {
             FilterParams::PathBlur { .. } => "Path Blur",
             FilterParams::Custom { .. } => "Custom",
             FilterParams::HsbHsl { .. } => "HSB/HSL",
+            FilterParams::ColorToAlpha { .. } => "Color to Alpha",
             FilterParams::DeInterlace { .. } => "De-Interlace",
             FilterParams::NtscColors => "NTSC Colors",
             FilterParams::FilterGallery { effects } => match effects.as_slice() {
@@ -615,7 +675,7 @@ fn halo_ext(p: &FilterParams) -> Halo {
         FilterParams::Pointillize { cell_size, .. } => r(cell_size.max(1.0) * 2.0),
         FilterParams::Facet => r(3.0),
         FilterParams::Fragment => r(4.0),
-        FilterParams::Mezzotint { .. } | FilterParams::HsbHsl { .. } | FilterParams::NtscColors => Halo::Radius(0),
+        FilterParams::Mezzotint { .. } | FilterParams::HsbHsl { .. } | FilterParams::ColorToAlpha { .. } | FilterParams::NtscColors => Halo::Radius(0),
         FilterParams::Diffuse { .. } => r(1.0),
         FilterParams::Extrude { size, depth, .. } => r(stylize2::extrude_reach(*depth) + size.clamp(2.0, 255.0) * 3.0 + 1.0),
         FilterParams::OilPaint { stylization, scale, .. } => r(oil::reach(*stylization, *scale)),
@@ -626,10 +686,12 @@ fn halo_ext(p: &FilterParams) -> Halo {
         // Generators and per-pixel renders only need the bounds geometry (always in the context).
         FilterParams::Fibers { .. } | FilterParams::LensFlare { .. } => Halo::Radius(0),
         FilterParams::LightingEffects { .. } => r(1.0),
+        FilterParams::Relight { intensity, .. } if *intensity == 0.0 => Halo::Radius(0),
+        FilterParams::Relight { .. } => Halo::Radius(relight::halo_radius_max()),
         FilterParams::ReduceNoise { .. } => r(denoise::reach()),
         FilterParams::SmartBlur { radius, .. } => r(*radius),
         FilterParams::LensBlur { radius, .. } => r(*radius),
-        FilterParams::ShapeBlur { radius, .. } => r(*radius),
+        FilterParams::ShapeBlur { radius, .. } => r(shape_blur::radius(*radius)),
         FilterParams::TiltShift { blur, .. } => r(gallery::reach(*blur)),
         FilterParams::IrisBlur { pins } => r(gallery::reach(pins.iter().map(|p| p.blur).fold(0.0, f32::max))),
         FilterParams::FieldBlur { pins } => r(gallery::reach(pins.iter().map(|p| p.blur).fold(0.0, f32::max))),
@@ -660,7 +722,9 @@ pub fn kernel(params: &FilterParams, src: &Image, out: Rect, ctx: &Ctx) -> Vec<f
         FilterParams::GaussianBlur { radius } => blur::gaussian(src, out, ctx, *radius),
         FilterParams::BoxBlur { radius } => blur::boxed(src, out, ctx, *radius),
         FilterParams::MotionBlur { angle, distance } => blur::motion(src, out, ctx, *angle, *distance),
-        FilterParams::RadialBlur { amount, method, center_x, center_y } => blur::radial(src, out, ctx, *amount, *method, (*center_x, *center_y)),
+        FilterParams::RadialBlur { amount, method, quality, center_x, center_y } => {
+            blur::radial(src, out, ctx, *amount, *method, *quality, (*center_x, *center_y))
+        }
         FilterParams::SurfaceBlur { radius, threshold } => blur::surface(src, out, ctx, *radius, *threshold),
         FilterParams::UnsharpMask { amount, radius, threshold } => sharpen::unsharp(src, out, ctx, *amount, *radius, *threshold),
         FilterParams::SmartSharpen { amount, radius, reduce_noise } => sharpen::smart(src, out, ctx, *amount, *radius, *reduce_noise),
@@ -759,6 +823,12 @@ pub fn kernel(params: &FilterParams, src: &Image, out: Rect, ctx: &Ctx) -> Vec<f
                 white_is_high: *white_is_high,
             },
         ),
+        FilterParams::Relight { angle, elevation, intensity, ambient, warmth, softness } => relight::relight(
+            src,
+            out,
+            ctx,
+            relight::Params { angle: *angle, elevation: *elevation, intensity: *intensity, ambient: *ambient, warmth: *warmth, softness: *softness },
+        ),
         FilterParams::ReduceNoise { strength, preserve_details, reduce_color_noise, sharpen_details, remove_jpeg_artifact } => denoise::reduce_noise(
             src,
             out,
@@ -818,6 +888,9 @@ pub fn kernel(params: &FilterParams, src: &Image, out: Rect, ctx: &Ctx) -> Vec<f
         FilterParams::PathBlur { paths } => gallery::path(src, out, ctx, paths),
         FilterParams::Custom { kernel, scale, offset } => other2::custom(src, out, ctx, kernel, *scale, *offset),
         FilterParams::HsbHsl { input, output } => other2::hsb_hsl(src, out, ctx, *input, *output),
+        FilterParams::ColorToAlpha { color, transparency_threshold, opacity_threshold } => {
+            color_to_alpha::color_to_alpha(src, out, ctx, *color, *transparency_threshold, *opacity_threshold)
+        }
         FilterParams::DeInterlace { eliminate_even, interpolate } => video::deinterlace(src, out, ctx, *eliminate_even, *interpolate),
         FilterParams::NtscColors => video::ntsc(src, out, ctx),
         FilterParams::FilterGallery { effects } => artistic_fx::run(effects, src, out, ctx),
@@ -832,7 +905,7 @@ pub const TILE: i32 = 256;
 /// the halo (blurs spread into transparent areas). Clipped to the
 /// selection's bounds when there is one.
 pub fn output_area(params: &FilterParams, content: Rect, bounds: Rect, selection_bounds: Option<Rect>) -> Rect {
-    let mut area = match params.halo() {
+    let mut area = match params.halo_for(bounds) {
         Halo::Bounds => bounds,
         Halo::Radius(r) => {
             if content.is_empty() {
@@ -851,14 +924,14 @@ pub fn output_area(params: &FilterParams, content: Rect, bounds: Rect, selection
 /// Applies a filter to `area` of `surface`, mixing with the original by the
 /// selection coverage (channel 0 of `selection`). Returns the new surface.
 pub fn apply(surface: &Surface, params: &FilterParams, area: Rect, bounds: Rect, selection: Option<&Surface>) -> Surface {
-    apply_tiled(surface, params, area, bounds, selection, auto_tile(params), None)
+    apply_tiled(surface, params, area, bounds, selection, auto_tile(params, bounds), None)
 }
 
 /// [`apply`] for a layer in a document: neighbourhood filters repeat the edge pixels of `extent`
 /// (the canvas plus any off-canvas pixels the layer has) instead of reading transparency beyond
 /// it, and the output is clipped to `extent`, as Photoshop does at the canvas edge.
 pub fn apply_in(surface: &Surface, params: &FilterParams, area: Rect, bounds: Rect, selection: Option<&Surface>, extent: Rect) -> Surface {
-    apply_tiled(surface, params, area.intersect(&extent), bounds, selection, auto_tile(params), Some(extent))
+    apply_tiled(surface, params, area.intersect(&extent), bounds, selection, auto_tile(params, bounds), Some(extent))
 }
 
 /// [`apply_in`] that can be cancelled (checked before each tile) and reports progress per tile
@@ -872,13 +945,13 @@ pub fn apply_in_with(
     extent: Rect,
     ctl: &photocraft_raster::Interrupt,
 ) -> Option<Surface> {
-    apply_tiled_with(surface, params, area.intersect(&extent), bounds, selection, auto_tile(params), Some(extent), ctl)
+    apply_tiled_with(surface, params, area.intersect(&extent), bounds, selection, auto_tile(params, bounds), Some(extent), ctl)
 }
 
 /// Results do not depend on the tiling, so wide-halo filters use bigger tiles to keep the
 /// re-read margin (and its cost) below ~2× the tile area.
-fn auto_tile(params: &FilterParams) -> i32 {
-    match params.halo() {
+fn auto_tile(params: &FilterParams, bounds: Rect) -> i32 {
+    match params.halo_for(bounds) {
         Halo::Radius(r) => TILE.max((2 * r + 63) / 64 * 64).min(2048),
         Halo::Bounds => TILE,
     }
@@ -894,12 +967,13 @@ pub fn apply_tiled(
     tile: i32,
     extent: Option<Rect>,
 ) -> Surface {
-    // Never cancelled, so always `Some`; the fallback (the input unchanged) is unreachable.
+    // Preserve the input if a checked Shape Blur allocation cannot be completed.
     apply_tiled_with(surface, params, area, bounds, selection, tile, extent, &photocraft_raster::Interrupt::NONE).unwrap_or_else(|| surface.clone())
 }
 
 /// [`apply_tiled`] with cancellation (checked before each tile, so a cancel takes effect within
-/// one tile's work) and progress (after each group of tiles). `None` when cancelled.
+/// one tile's work) and progress (after each group of tiles). `None` when cancelled,
+/// or when Shape Blur cannot allocate a tile.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_tiled_with(
     surface: &Surface,
@@ -911,23 +985,72 @@ pub fn apply_tiled_with(
     extent: Option<Rect>,
     ctl: &photocraft_raster::Interrupt,
 ) -> Option<Surface> {
+    apply_tiled_with_impl(surface, params, area, bounds, selection, tile, extent, ctl, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_tiled_with_impl(
+    surface: &Surface,
+    params: &FilterParams,
+    area: Rect,
+    bounds: Rect,
+    selection: Option<&Surface>,
+    tile: i32,
+    extent: Option<Rect>,
+    ctl: &photocraft_raster::Interrupt,
+    prepare_radial: bool,
+) -> Option<Surface> {
+    if ctl.cancelled() {
+        return None;
+    }
     let mut out = surface.clone();
     if area.is_empty() {
         return Some(out);
     }
+    if let Some(boxes) = blur::box_widths(params) {
+        return apply_box_blur(out, surface, area, extent, selection, &boxes, ctl);
+    }
+    if let Some(result) = blur::motion_apply::apply(surface, params, area, bounds, selection, extent, tile, ctl) {
+        return result;
+    }
+    // The public tile override must not create a zero-step loop or an
+    // unbounded Shape Blur scratch buffer. Standard automatic tiles are unchanged.
+    let tile = if matches!(params, FilterParams::ShapeBlur { .. }) { tile.clamp(1, 2048) } else { tile };
     let fmt = surface.format();
     let ctx = Ctx { bounds, mode: fmt.mode, alpha: fmt.alpha };
-    let halo = params.halo();
+    // Prepare the immutable sample transforms once for all output tiles. If the
+    // optional table allocation fails, use the existing sampler; only a real
+    // cancellation returns None. Source reads keep their upstream semantics.
+    let radial = match params {
+        FilterParams::RadialBlur { amount, method, quality, center_x, center_y } if prepare_radial => {
+            blur::radial::Plan::for_area(bounds, *amount, *method, *quality, (*center_x, *center_y), area, ctl)
+        }
+        _ => None,
+    };
+    if ctl.cancelled() {
+        return None;
+    }
+    let halo = params.halo_for(bounds);
     let shared = (halo == Halo::Bounds).then(|| Image::read(surface, bounds.union(&area)));
+    // Shape rasterization depends only on params, not on a tile's pixels.
+    let shape = match params {
+        FilterParams::ShapeBlur { radius, shape } => {
+            if ctl.cancelled() {
+                return None;
+            }
+            Some(shape_blur::Prepared::new(*radius, *shape))
+        }
+        _ => None,
+    };
     let mut tiles = Vec::new();
     let mut y = area.y0;
     while y < area.y1 {
         let mut x = area.x0;
         while x < area.x1 {
-            tiles.push(Rect::new(x, y, (x + tile).min(area.x1), (y + tile).min(area.y1)));
-            x += tile;
+            tiles.push(Rect::new(x, y, x.saturating_add(tile).min(area.x1), y.saturating_add(tile).min(area.y1)));
+            x = x.saturating_add(tile);
         }
-        y += tile;
+        y = y.saturating_add(tile);
     }
     // Tiles finished so far, for progress reported per tile (from any worker thread).
     let finished = std::sync::atomic::AtomicUsize::new(0);
@@ -958,21 +1081,19 @@ pub fn apply_tiled_with(
                 &owned
             }
         };
-        let mut data = kernel(params, src, *t, &ctx);
+        let Some(mut data) = (match (&shape, &radial) {
+            (Some(shape), _) => shape.checked_run(src, *t, &ctx),
+            (None, Some(plan)) => match plan.filter(src, *t, &ctx, ctl) {
+                Some(data) => Some(data),
+                None if ctl.cancelled() => None,
+                None => Some(kernel(params, src, *t, &ctx)),
+            },
+            (None, None) => Some(kernel(params, src, *t, &ctx)),
+        }) else {
+            return (*t, Vec::new());
+        };
         if let Some(sel) = selection {
-            let n = src.ch;
-            let w = t.width() as usize;
-            for (i, px) in data.chunks_exact_mut(n).enumerate() {
-                let (xx, yy) = (t.x0 + (i % w) as i32, t.y0 + (i / w) as i32);
-                let k = sel.pixel(xx, yy)[0].clamp(0.0, 1.0);
-                if k >= 1.0 {
-                    continue;
-                }
-                for (c, v) in px.iter_mut().enumerate() {
-                    let o = src.get(xx, yy, c);
-                    *v = o + (*v - o) * k;
-                }
-            }
+            mix_selection(&mut data, *t, sel, src);
         }
         tick();
         (*t, data)
@@ -1000,6 +1121,11 @@ pub fn apply_tiled_with(
         if ctl.cancelled() {
             return None;
         }
+        // Shape Blur can reject malformed geometry or an allocation failure.
+        // Do not hand an incomplete tile to Surface::write_region.
+        if shape.is_some() && results.iter().any(|(t, data)| data.len() != t.width() as usize * t.height() as usize * fmt.channels()) {
+            return None;
+        }
         for (t, data) in results {
             out.write_region(t, &data);
         }
@@ -1009,6 +1135,87 @@ pub fn apply_tiled_with(
     Some(out)
 }
 
+/// [`apply_tiled_with`] for the blurs run as box passes ([`blur::box_widths`]): the whole area at
+/// once (in column bands of about [`RESULT_BUDGET`] bytes of floats), so the wide halo of a large
+/// radius is read once rather than around every tile. Pixels beyond `extent` repeat its edge, as
+/// [`Image::read_clamped`] does for tiles; without one the surface is read (transparent where empty).
+fn apply_box_blur(
+    mut out: Surface,
+    surface: &Surface,
+    area: Rect,
+    extent: Option<Rect>,
+    selection: Option<&Surface>,
+    boxes: &[usize],
+    ctl: &photocraft_raster::Interrupt,
+) -> Option<Surface> {
+    let fmt = surface.format();
+    let n = fmt.channels();
+    let reach = i32::try_from(boxes.iter().map(|w| w / 2).sum::<usize>()).unwrap_or(i32::MAX);
+    let grown = area.inflate(reach);
+    let src = extent.map(|e| grown.intersect(&e)).filter(|r| !r.is_empty()).unwrap_or(grown);
+    let read = |r: Rect, buf: &mut Vec<f32>| surface.read_region_into(r, buf);
+    // Per output column: the horizontal results for every source row, plus the final samples.
+    let column_bytes = (src.height() as usize + area.height() as usize) * n * std::mem::size_of::<f32>();
+    let band = i32::try_from(RESULT_BUDGET / column_bytes.max(1)).unwrap_or(i32::MAX).max(blur::STRIP) / blur::STRIP * blur::STRIP;
+    let bands: Vec<Rect> = (area.x0..area.x1).step_by(band as usize).map(|x| Rect::new(x, area.y0, x.saturating_add(band).min(area.x1), area.y1)).collect();
+    for (i, b) in bands.iter().enumerate() {
+        let strips = blur::box_blur(src, &read, *b, n, fmt.alpha, boxes, ctl)?;
+        // Each strip lies in one tile column: the columns' tiles are written in parallel.
+        let mut columns: Vec<(Surface, Vec<blur::Strip>)> = Vec::new();
+        for (t, data) in strips {
+            match columns.last_mut() {
+                Some((_, v)) if v.first().is_some_and(|(r, _)| r.x0.div_euclid(photocraft_geom::TILE_SIZE) == t.x0.div_euclid(photocraft_geom::TILE_SIZE)) => {
+                    v.push((t, data))
+                }
+                _ => columns.push((Surface::with_default(fmt, &surface.default_pixel()), vec![(t, data)])),
+            }
+        }
+        for (s, v) in &mut columns {
+            let r = v.iter().fold(Rect::EMPTY, |acc, (t, _)| if acc.is_empty() { *t } else { acc.union(t) });
+            s.put_tiles(out.take_tiles(r));
+        }
+        let write = |(s, v): &mut (Surface, Vec<blur::Strip>)| {
+            for (t, data) in v.iter_mut() {
+                if let Some(sel) = selection {
+                    mix_selection(data, *t, sel, &Image::read(surface, *t));
+                }
+                s.write_region(*t, data);
+            }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use rayon::prelude::*;
+            columns.par_iter_mut().for_each(write);
+        }
+        #[cfg(target_arch = "wasm32")]
+        columns.iter_mut().for_each(write);
+        for (s, _) in columns {
+            out.put_tiles(s.tiles().map(|(c, t)| (*c, t.clone())));
+        }
+        ctl.progress(0.98 * (i + 1) as f32 / bands.len() as f32);
+    }
+    out.prune();
+    ctl.progress(1.0);
+    Some(out)
+}
+
+/// Mixes filtered `data` for `t` back toward the original pixels in `orig` by the selection's
+/// coverage (channel 0 of `sel`).
+fn mix_selection(data: &mut [f32], t: Rect, sel: &Surface, orig: &Image) {
+    let w = t.width() as usize;
+    for (i, px) in data.chunks_exact_mut(orig.ch.max(1)).enumerate() {
+        let (x, y) = (t.x0 + (i % w) as i32, t.y0 + (i / w) as i32);
+        let k = sel.pixel(x, y)[0].clamp(0.0, 1.0);
+        if k >= 1.0 {
+            continue;
+        }
+        for (c, v) in px.iter_mut().enumerate() {
+            let o = orig.get(x, y, c);
+            *v = o + (*v - o) * k;
+        }
+    }
+}
+
 /// Bytes of float filter results held at once by [`apply_tiled`].
 const RESULT_BUDGET: usize = 256 << 20;
 
@@ -1016,3 +1223,21 @@ const RESULT_BUDGET: usize = 256 << 20;
 mod tests;
 #[cfg(test)]
 mod tests_ext;
+
+#[cfg(test)]
+mod tests_mosaic;
+
+/// The current upstream sampler through the identical source/selection/tile pipeline.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn apply_radial_reference(
+    surface: &Surface,
+    params: &FilterParams,
+    area: Rect,
+    bounds: Rect,
+    selection: Option<&Surface>,
+    extent: Rect,
+    ctl: &photocraft_raster::Interrupt,
+) -> Option<Surface> {
+    apply_tiled_with_impl(surface, params, area.intersect(&extent), bounds, selection, auto_tile(params, bounds), Some(extent), ctl, false)
+}

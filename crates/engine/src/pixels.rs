@@ -8,17 +8,71 @@ use photocraft_raster::{Surface, from_rgba, to_rgba};
 /// Apply an adjustment destructively to a surface, weighted by an optional selection.
 /// Applies `adj` to a surface (any colour model and depth, via straight RGBA) through the
 /// selection; `mode` is the document's, for the tone transfer (e.g. Exposure in Grayscale).
+/// Works tile by tile in parallel, so a large layer needs one tile's buffers per thread rather
+/// than four full-layer copies, and the result is the same as one pass over the whole region.
 pub fn adjust_surface(s: &mut Surface, adj: &Adjustment, selection: Option<&Surface>, mode: photocraft_color::ColorMode) {
+    use rayon::prelude::*;
     let r = s.content_bounds();
     if r.is_empty() {
         return;
     }
     let fmt = s.format();
+    let done: Vec<_> = s
+        .take_tiles(r)
+        .into_par_iter()
+        .flat_map_iter(|(tc, tile)| {
+            // A one-tile surface, so `adjusted` reads and writes this tile only.
+            let mut one = Surface::new(fmt);
+            one.put_tiles([(tc, tile)]);
+            let tr = tc.rect().intersect(&r);
+            let out = adjusted(&one, tr, adj, selection, mode);
+            one.write_region(tr, &out);
+            one.take_tiles(tc.rect())
+        })
+        .collect();
+    s.put_tiles(done);
+}
+
+#[cfg(test)]
+#[path = "pixels_tests.rs"]
+mod tests;
+
+/// Applies `adj` to a layer mask through the selection. Untouched mask pixels count (they read as
+/// the mask's default value), and without a selection the default changes too, since a mask
+/// reaches past the canvas: Invert turns a reveal-all mask into a hide-all one (#780).
+pub fn adjust_mask(s: &mut Surface, adj: &Adjustment, selection: Option<&Surface>) {
+    let mode = photocraft_color::ColorMode::Grayscale;
+    if let Some(sel) = selection {
+        let r = sel.content_bounds();
+        if !r.is_empty() {
+            let out = adjusted(s, r, adj, Some(sel), mode);
+            s.write_region(r, &out);
+            s.prune();
+        }
+        return;
+    }
+    let fmt = s.format();
+    let unit = Rect::from_xywh(0, 0, 1, 1);
+    let mut out = Surface::with_default(fmt, &adjusted(&Surface::with_default(fmt, &s.default_pixel()), unit, adj, None, mode));
+    let r = s.tile_bounds();
+    if !r.is_empty() {
+        out.write_region(r, &adjusted(s, r, adj, None, mode));
+    }
+    out.prune();
+    *s = out;
+}
+
+/// `s`'s pixels over `r` (untouched ones included) with `adj` applied through the selection, encoded.
+fn adjusted(s: &Surface, r: Rect, adj: &Adjustment, selection: Option<&Surface>, mode: photocraft_color::ColorMode) -> Vec<f32> {
+    let fmt = s.format();
     let n = fmt.channels();
     let raw = s.read_region(r);
     let mut buf = Buffer { rect: r, px: raw.chunks_exact(n).map(|p| to_rgba(&fmt, p)).collect() };
     let orig = buf.clone();
-    adjust::apply_with(adj, &mut buf, adjust::Transfer::for_mode(mode));
+    // 32-bit documents get the float behaviour of an adjustment layer there (Levels doesn't clip);
+    // integer depths keep the unrounded, clipped curves.
+    let depth = (fmt.sample == photocraft_color::SampleType::F32).then_some(fmt.sample);
+    adjust::apply_depth(adj, &mut buf, adjust::Transfer::for_document(mode, fmt.sample), depth);
     let w = r.width() as usize;
     let mut out = Vec::with_capacity(raw.len());
     for (i, (a, o)) in buf.px.iter().zip(&orig.px).enumerate() {
@@ -28,7 +82,7 @@ pub fn adjust_surface(s: &mut Surface, adj: &Adjustment, selection: Option<&Surf
         let m = photocraft_raster::from_rgba_into(&fmt, mixed, &mut enc);
         out.extend_from_slice(&enc[..m]);
     }
-    s.write_region(r, &out);
+    out
 }
 
 /// Fill (respecting selection coverage) with a straight RGBA colour.

@@ -10,18 +10,22 @@
 //!   shown after a short delay so quick jobs don't flash it. Esc cancels.
 //! - Files opening in the background get a document tab at once ([`OpenTab`]); its canvas area
 //!   shows the progress, and closing the tab cancels the open.
+//! - Saves encode and write on a worker ([`start_save`], #2017) under the modal progress dialog;
+//!   the document is locked meanwhile, and the save is recorded when the job ends.
 //!
 //! The canvas keeps showing the pre-job state: workers never touch the session's documents.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 
 use egui::{Color32, Rect, RichText, Sense, Stroke, vec2};
-use photocraft_engine::jobs::{JobEvent, JobId, JobInfo, JobOutcome, OPEN_JOB, OpenSource, Started};
+use photocraft_doc::DocId;
+use photocraft_engine::jobs::{JobCtx, JobEvent, JobId, JobInfo, JobOutcome, OPEN_JOB, OpenSource, Started};
 use serde_json::{Value, json};
 
 use crate::theme::Tokens;
-use crate::{ControlResponse, PhotocraftApp, notices};
+use crate::{ControlResponse, ExportSettings, PhotocraftApp, SaveFileFn, notices};
 
 /// Delay before the modal progress dialog appears (quick jobs finish without it).
 pub const DIALOG_DELAY_MS: f64 = 250.0;
@@ -34,6 +38,89 @@ pub struct OpenTab {
     pub name: String,
     /// Where it was read from (File › Save writes back there; added to Open Recent).
     pub path: Option<String>,
+    /// The tab position it goes to when it opens (a file dropped on the tabs); `None`: the end.
+    pub slot: Option<usize>,
+}
+
+/// The job command of a background save.
+pub const SAVE_JOB: &str = "file.save";
+
+const ENCODING: u8 = 0;
+const WRITING: u8 = 1;
+const CANCELLED: u8 = 2;
+
+/// A save worker's stage, shared between the worker and the UI.
+#[derive(Debug, Default)]
+pub struct SaveState {
+    stage: AtomicU8,
+    finished: AtomicBool,
+}
+
+impl SaveState {
+    /// Cancel unless writing has started; false once it has.
+    fn try_cancel(&self) -> bool {
+        matches!(self.stage.compare_exchange(ENCODING, CANCELLED, Ordering::AcqRel, Ordering::Acquire), Ok(_) | Err(CANCELLED))
+    }
+
+    /// The worker has returned (or unwound): nothing of this save can still touch the file.
+    pub fn finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+}
+
+/// Marks the worker finished when the work closure is dropped, which also covers a panic.
+struct WorkerDone(Arc<SaveState>);
+
+impl Drop for WorkerDone {
+    fn drop(&mut self) {
+        self.0.finished.store(true, Ordering::Release);
+    }
+}
+
+/// What a save worker gets (see [`crate::Services::save_file`]): the job's progress and
+/// cancellation, and [`commit`](Self::commit), the point after which the save can no longer
+/// be cancelled.
+pub struct SaveCtl {
+    pub job: JobCtx,
+    state: Arc<SaveState>,
+}
+
+impl SaveCtl {
+    pub fn progress(&self, fraction: f32, message: &str) {
+        self.job.progress(fraction, message);
+    }
+
+    /// `Err` once the save was cancelled: stop, write nothing.
+    pub fn check(&self) -> Result<(), String> {
+        if self.job.cancelled() || self.state.stage.load(Ordering::Acquire) == CANCELLED { Err(SAVE_CANCELLED.into()) } else { Ok(()) }
+    }
+
+    /// Call once, right before replacing the file. `Ok`: the save can no longer be cancelled
+    /// (Cancel and Esc are refused) and must run to the end; `Err`: it was cancelled first and
+    /// nothing may be written.
+    pub fn commit(&self) -> Result<(), String> {
+        self.check()?;
+        self.state.stage.compare_exchange(ENCODING, WRITING, Ordering::AcqRel, Ordering::Acquire).map(|_| ()).map_err(|_| SAVE_CANCELLED.into())
+    }
+}
+
+/// The error a cancelled save worker returns.
+const SAVE_CANCELLED: &str = "cancelled";
+
+/// A save running in the background: what to record once the file is written.
+#[derive(Clone, Debug)]
+pub struct SaveJob {
+    pub job: JobId,
+    pub doc: DocId,
+    /// The document's revision when the save started (the job locks it against edits).
+    pub revision: u64,
+    pub path: String,
+    /// A copy leaves the document's path and unsaved state alone.
+    pub copy: bool,
+    pub state: Arc<SaveState>,
+    /// The job has ended (cancelled, say) but its worker may still be running: kept until it
+    /// returns, so quitting and another save to the same file wait for it.
+    pub ended: bool,
 }
 
 /// The shell's job bookkeeping.
@@ -43,6 +130,10 @@ pub struct JobsUi {
     pub(crate) waiters: Vec<(JobId, Sender<ControlResponse>)>,
     /// Background opens, in tab order.
     pub opens: Vec<OpenTab>,
+    /// Background saves.
+    pub saves: Vec<SaveJob>,
+    /// The window was asked to close while a save was writing: close it once none is left.
+    pub close_after_saves: bool,
     /// The open tab shown in the canvas area instead of the active document.
     pub focus: Option<JobId>,
     /// The job the latest [`run`] started (the control channel waits on it).
@@ -71,11 +162,12 @@ pub fn run(app: &mut PhotocraftApp, id: &str, params: Value) -> Result<Value, St
 /// Open a file in the background: a tab appears at once and shows the progress; the document
 /// replaces it when decoded. `path` is remembered for File › Save and Open Recent.
 pub fn start_open(app: &mut PhotocraftApp, name: &str, path: Option<String>, source: OpenSource) -> Result<(), String> {
+    let name = &app.open_name(name);
     match app.session.start_open(name, source).map_err(|e| e.to_string())? {
         // Inline (wasm): finish now, like a background open that ended at once.
-        Started::Done(v) => finish_open(app, name, path.as_deref(), &v),
+        Started::Done(v) => finish_open(app, name, path.as_deref(), &v, None),
         Started::Job(job) => {
-            app.jobs.opens.push(OpenTab { job, name: name.to_string(), path });
+            app.jobs.opens.push(OpenTab { job, name: name.to_string(), path, slot: None });
             app.jobs.focus = Some(job);
             app.ui.chrome.home = None;
             app.ui.status = crate::i18n::fmt(tl!("Opening {name}…"), &[("name", name)]);
@@ -85,15 +177,114 @@ pub fn start_open(app: &mut PhotocraftApp, name: &str, path: Option<String>, sou
     }
 }
 
+/// Save the active document to `path` in the background: `save` encodes and writes it on a
+/// worker while the window keeps drawing and shows the progress dialog. The document is locked
+/// until the job ends, which [`tick`] records like a synchronous save. `Ok(None)`: started;
+/// `Ok(Some(..))`: it ran inline (wasm) and is already recorded.
+pub fn start_save(
+    app: &mut PhotocraftApp,
+    path: String,
+    settings: ExportSettings,
+    copy: bool,
+    save: SaveFileFn,
+) -> Result<Option<(String, Vec<String>)>, String> {
+    let st = app.session.active().ok_or("no document")?;
+    if let Some(j) = app.session.job_on(st.doc.id) {
+        // The engine's wording for a command refused while a job runs.
+        return Err(format!("“{}” is still running on this document; wait for it to finish or cancel it (Esc)", j.label));
+    }
+    let name = crate::file_open::display_name(&path);
+    // One writer per file: an older snapshot must not land after a newer one.
+    if app.jobs.saves.iter().any(|s| s.path == path) {
+        return Err(crate::i18n::fmt(tl!("A save to {name} is still running; try again when it finishes"), &[("name", &name)]));
+    }
+    let (snapshot, doc, revision) = (Arc::clone(&st.doc), st.doc.id, st.revision);
+    let label = crate::i18n::fmt(tl!("Saving {name}"), &[("name", &name)]);
+    let target = path.clone();
+    let state = Arc::new(SaveState::default());
+    let worker = Arc::clone(&state);
+    let started = app.session.start_job(
+        SAVE_JOB,
+        json!({"path": path}),
+        &label,
+        true,
+        move |ctx| {
+            let _done = WorkerDone(Arc::clone(&worker));
+            let ctl = SaveCtl { job: ctx.clone(), state: worker };
+            save(&snapshot, &target, &settings, &ctl)
+                .map_err(|e| if ctl.check().is_err() { photocraft_engine::EngineError::Cancelled } else { photocraft_engine::EngineError::Other(e) })
+        },
+        |_, warnings: Vec<String>| Ok(json!({"warnings": warnings})),
+    );
+    match started.map_err(|e| e.to_string())? {
+        Started::Done(v) => {
+            let warnings = warnings_of(&v);
+            app.saved(doc, revision, &path, &warnings, copy);
+            Ok(Some((path, warnings)))
+        }
+        Started::Job(job) => {
+            app.jobs.saves.push(SaveJob { job, doc, revision, path, copy, state, ended: false });
+            // Control and MCP requests wait on it, as for other jobs.
+            app.jobs.last_started = Some(job);
+            // The status bar's progress readout names the save; clear any old message.
+            app.ui.status.clear();
+            app.ui.status_error = false;
+            Ok(None)
+        }
+    }
+}
+
+fn warnings_of(v: &Value) -> Vec<String> {
+    v.get("warnings").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default()
+}
+
+/// A background save ended: record it, or report why not. The close prompt waiting on it moves
+/// on, or asks again.
+fn finish_save(app: &mut PhotocraftApp, ctx: &egui::Context, save: SaveJob, label: &str, outcome: JobOutcome) {
+    match outcome {
+        JobOutcome::Done(v) => {
+            app.saved(save.doc, save.revision, &save.path, &warnings_of(&v), save.copy);
+            if !save.copy {
+                crate::discard_ui::saved_document(app, ctx, save.doc);
+            }
+        }
+        JobOutcome::Failed(err) => {
+            // Don't close the window over the error.
+            app.jobs.close_after_saves = false;
+            notices::error(app, crate::i18n::fmt(tl!("Save failed: {error}"), &[("error", &err)]));
+        }
+        JobOutcome::Cancelled => {
+            app.jobs.close_after_saves = false;
+            app.ui.status = crate::i18n::fmt(tl!("Cancelled {label}"), &[("label", label)]);
+            app.ui.status_error = false;
+        }
+    }
+    close_after_saves(app, ctx);
+}
+
+/// Forget saves whose job ended and whose worker has returned; repeat a held window close once
+/// no save worker is left.
+fn close_after_saves(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    app.jobs.saves.retain(|s| !(s.ended && s.state.finished()));
+    if !app.saving() && std::mem::take(&mut app.jobs.close_after_saves) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+}
+
 /// Per frame: apply finished jobs and react to them; keep frames coming while jobs run; Esc
 /// cancels the job in view.
 pub fn tick(app: &mut PhotocraftApp, ctx: &egui::Context) {
     for e in app.session.poll_jobs() {
-        on_event(app, e);
+        on_event(app, ctx, e);
     }
     // A focused open tab that ended (or was cancelled elsewhere) gives way to the documents.
     if app.jobs.focus.is_some_and(|j| !app.jobs.opens.iter().any(|o| o.job == j)) {
         app.jobs.focus = app.jobs.opens.last().map(|o| o.job);
+    }
+    if app.saving() {
+        close_after_saves(app, ctx);
+        // Keep checking on a cancelled save's worker until it returns.
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
     if !app.session.has_jobs() {
         return;
@@ -120,6 +311,15 @@ pub fn job_in_view(app: &PhotocraftApp) -> Option<JobInfo> {
 /// Cancel job `id` (the status bar's ×, the dialog's Cancel, Esc, closing an opening tab).
 pub fn cancel(app: &mut PhotocraftApp, id: JobId) {
     let label = app.session.job(id).map(|j| j.label);
+    // A save that has started replacing the file runs to the end: cancelling it now would leave
+    // the file written but the document marked unsaved.
+    if let Some(save) = app.jobs.saves.iter().find(|s| s.job == id)
+        && !save.state.try_cancel()
+    {
+        app.ui.status = crate::i18n::fmt(tl!("{label} is writing the file and can no longer be cancelled"), &[("label", label.as_deref().unwrap_or_default())]);
+        app.ui.status_error = false;
+        return;
+    }
     if app.session.cancel_job(id) {
         // The event (and its status text) arrives with the next poll; say so now as well.
         if let Some(l) = label {
@@ -129,7 +329,7 @@ pub fn cancel(app: &mut PhotocraftApp, id: JobId) {
     }
 }
 
-fn on_event(app: &mut PhotocraftApp, e: JobEvent) {
+fn on_event(app: &mut PhotocraftApp, ctx: &egui::Context, e: JobEvent) {
     // Control requests waiting on this job.
     let reply = match &e.outcome {
         JobOutcome::Done(v) => json!({"ok": true, "result": v}),
@@ -144,12 +344,32 @@ fn on_event(app: &mut PhotocraftApp, e: JobEvent) {
             true
         }
     });
+    if crate::prefs_ui::on_recovery_event(app, &e) {
+        return;
+    }
+    // Camera Raw's open-time re-develop and its final step.
+    if crate::camera_raw_ui::on_redevelop_event(app, &e) {
+        return;
+    }
+    if e.command == SAVE_JOB
+        && let Some(i) = app.jobs.saves.iter().position(|s| s.job == e.id)
+    {
+        // A cancelled save's worker may still be running: keep it counted until it returns.
+        let save = if app.jobs.saves[i].state.finished() {
+            app.jobs.saves.remove(i)
+        } else {
+            app.jobs.saves[i].ended = true;
+            app.jobs.saves[i].clone()
+        };
+        finish_save(app, ctx, save, &e.label, e.outcome);
+        return;
+    }
     if e.command == OPEN_JOB {
         let Some(i) = app.jobs.opens.iter().position(|o| o.job == e.id) else { return };
         let tab = app.jobs.opens.remove(i);
         match e.outcome {
             JobOutcome::Done(v) => {
-                if let Err(err) = finish_open(app, &tab.name, tab.path.as_deref(), &v) {
+                if let Err(err) = finish_open(app, &tab.name, tab.path.as_deref(), &v, tab.slot) {
                     app.open_failed(&tab.name, &err);
                 }
             }
@@ -188,21 +408,29 @@ fn on_event(app: &mut PhotocraftApp, e: JobEvent) {
 
 /// What [`crate::PhotocraftApp::open_bytes`] does after decoding, for a background open's result
 /// (`{document, warnings, color}`).
-fn finish_open(app: &mut PhotocraftApp, name: &str, path: Option<&str>, v: &Value) -> Result<(), String> {
-    let index = v.get("document").and_then(Value::as_u64).ok_or("the open job returned no document")? as usize;
+fn finish_open(app: &mut PhotocraftApp, name: &str, path: Option<&str>, v: &Value, slot: Option<usize>) -> Result<(), String> {
+    let mut index = v.get("document").and_then(Value::as_u64).ok_or("the open job returned no document")? as usize;
+    if let Some(slot) = slot
+        && let Ok(moved) = app.run("document.move", json!({"document": index, "to": slot}))
+    {
+        index = moved.get("document").and_then(Value::as_u64).map_or(index, |i| i as usize);
+    }
     let warnings: Vec<String> =
         v.get("warnings").and_then(Value::as_array).map(|a| a.iter().filter_map(|w| w.as_str().map(str::to_string)).collect()).unwrap_or_default();
     app.session.set_active(index);
-    if let (Some(p), Some(st)) = (path, app.session.active_mut()) {
-        st.path = Some(p.to_string());
-    }
     if let Some(p) = path {
-        app.push_recent(p);
+        app.opened_from(p);
     }
     app.sync_views();
     app.ui.status = format!("Opened {name}");
     app.ui.status_error = false;
-    notices::io_warnings(app, &format!("Opened {name}"), &warnings);
+    // A raw opens in Camera Raw first; the dialog says how it was developed.
+    if crate::camera_raw_ui::wants_open_dialog(app, &warnings) {
+        crate::camera_raw_ui::queue_open_dialog(app, name, path, None);
+        notices::io_warnings(app, &format!("Opened {name}"), &crate::camera_raw_ui::without_develop_note(&warnings));
+    } else {
+        notices::io_warnings(app, &format!("Opened {name}"), &warnings);
+    }
     // Script events bound to "Open Document".
     photocraft_engine::automate_cmds::document_opened(&mut app.session);
     app.sync_views();
@@ -263,7 +491,7 @@ pub fn status_progress(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     ui.label(RichText::new(percent(&j)).color(t.text_dim).size(11.5).monospace());
     let (br, _) = ui.allocate_exact_size(vec2(bar_w, bar_h), Sense::hover());
     bar(ui, br, shown_fraction(&j), &t);
-    let label = if more > 0 { format!("{} (+{more})", j.label) } else { j.label.clone() };
+    let label = if more > 0 { format!("{} (+{more})", tl!(&j.label)) } else { tl!(&j.label).to_owned() };
     ui.label(RichText::new(label).color(t.text_dim).size(12.0));
     if xresp.clicked() {
         cancel(app, j.id);
@@ -283,7 +511,7 @@ pub fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
     // Photoshop doesn't dim the window behind its progress dialog either.
     let modal = egui::Modal::new(egui::Id::new("job-progress")).backdrop_color(Color32::from_black_alpha(36)).show(ctx, |ui| {
         ui.set_width(360.0);
-        ui.label(RichText::new(&j.label).font(crate::theme::semibold(15.0)));
+        ui.label(RichText::new(tl!(&j.label)).font(crate::theme::semibold(15.0)));
         ui.add_space(4.0);
         crate::widgets::hairline(ui);
         ui.add_space(10.0);
@@ -367,6 +595,7 @@ pub fn inspect(app: &PhotocraftApp) -> Value {
     json!({
         "running": app.session.jobs(),
         "opening": app.jobs.opens.iter().map(|o| json!({"job": o.job.0, "name": o.name, "path": o.path})).collect::<Vec<_>>(),
+        "saving": app.jobs.saves.iter().map(|s| json!({"job": s.job.0, "path": s.path})).collect::<Vec<_>>(),
         "focus": app.jobs.focus.map(|j| j.0),
         "background": app.background_jobs,
     })

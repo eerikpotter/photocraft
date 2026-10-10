@@ -76,6 +76,36 @@ thread_local! {
     /// (Photoshop composites Lab documents in Lab; an anti-aliased edge between two colours
     /// differs by up to 14 / 255 from an sRGB mix: psd-tools stroke-color-descriptors-lab).
     pub static LAB_MIX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while rendering a 32-bit float document: Linear Dodge (Add) and Divide don't clip at 1
+    /// ([`generic::blend_rgb_hdr`]), as in Photoshop's 32-bit mode; integer depths clip.
+    pub static HDR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with [`LAB_MIX`] set to `lab`, then restores the value it had (also on unwind). A
+/// nested rayon job can run another tile on this thread mid-composite; clearing the flag there
+/// made the rest of the outer tile mix in sRGB (#1112).
+pub fn with_lab_mix<R>(lab: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LAB_MIX.with(|l| l.set(self.0));
+        }
+    }
+    let _restore = Restore(LAB_MIX.with(|l| l.replace(lab)));
+    f()
+}
+
+/// Runs `f` with [`HDR`] set to `hdr`, then restores the value it had (also on unwind), like
+/// [`with_lab_mix`].
+pub fn with_hdr<R>(hdr: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HDR.with(|h| h.set(self.0));
+        }
+    }
+    let _restore = Restore(HDR.with(|h| h.replace(hdr)));
+    f()
 }
 
 /// `B(Cb, Cs)` with Photoshop's variants.
@@ -85,6 +115,7 @@ pub fn blend_rgb(mode: BlendMode, cb: [f32; 3], cs: [f32; 3]) -> [f32; 3] {
         BlendMode::HardMix => std::array::from_fn(|i| hard_mix_ps(cb[i], cs[i])),
         BlendMode::ColorBurn => std::array::from_fn(|i| color_burn(cb[i], cs[i])),
         BlendMode::ColorDodge => std::array::from_fn(|i| color_dodge(cb[i], cs[i])),
+        m if HDR.with(|h| h.get()) => generic::blend_rgb_hdr(m, cb, cs),
         m => generic::blend_rgb(m, cb, cs),
     }
 }
@@ -255,6 +286,30 @@ mod tests {
                 (composite(m, [0.2, 0.5, 0.9, 0.7], [0.7, 0.1, 0.4, 0.6], 0.8), generic::composite(m, [0.2, 0.5, 0.9, 0.7], [0.7, 0.1, 0.4, 0.6], 0.8));
             for c in 0..4 {
                 assert!((a[c] - b[c]).abs() < 1e-6, "{m:?} {a:?} {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn generic_vivid_light_and_hard_mix_composites_match_photoshop() {
+        let cases = [
+            (BlendMode::HardMix, 0.0, 1.0),
+            (BlendMode::HardMix, 1.0, 0.0),
+            (BlendMode::HardMix, 0.6, 0.4),
+            (BlendMode::HardMix, 0.6, 0.3),
+            (BlendMode::VividLight, 1.0, 0.0),
+            (BlendMode::VividLight, 0.0, 1.0),
+            (BlendMode::VividLight, 0.75, 0.25),
+            (BlendMode::VividLight, 0.25, 0.75),
+        ];
+
+        for (mode, cb, cs) in cases {
+            let backdrop = [cb, cb, cb, 1.0];
+            let source = [cs, cs, cs, 1.0];
+            let generic = generic::composite(mode, backdrop, source, 1.0);
+            let photoshop = composite(mode, backdrop, source, 1.0);
+            for channel in 0..4 {
+                assert!((generic[channel] - photoshop[channel]).abs() < 1e-6, "{mode:?} Cb={cb} Cs={cs}: {generic:?} != {photoshop:?}");
             }
         }
     }

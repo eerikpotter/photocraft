@@ -82,8 +82,9 @@ pub fn checked(app: &PhotocraftApp, id: &str) -> Option<bool> {
         "image.analysis.countTool" => Some(app.ui.tool == Tool::Count),
         _ => {
             // View › Proof Setup simulations: checked while that proof is shown.
+            // A check item with no document too: an item's kind never changes (native menus).
             let kind = id.strip_prefix("view.proofSetup.").and_then(photocraft_engine::proof_sim::ProofKind::from_id)?;
-            let d = app.session.active()?;
+            let Some(d) = app.session.active() else { return Some(false) };
             let pv = app.session.color.proof(d.doc.id);
             Some(pv.enabled && pv.setup.kind == kind)
         }
@@ -158,15 +159,18 @@ pub fn menu(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<
             }
             r
         }
-        "file.import.notes" => {
-            let (name, bytes) = app.services.pick_open.as_mut().and_then(|f| f())?;
-            let r = photocraft_engine::notes_cmds::import_notes_from(&mut app.session, &name, &bytes).map_err(|e| e.to_string());
-            if r.is_ok() {
-                app.ui.analysis.notes = true;
-                app.sync_views();
-            }
-            r
-        }
+        "file.import.notes" => match app.active_doc_id() {
+            Ok(doc) => app.pick_file_bytes(move |app, name, bytes| {
+                app.refocus(doc)?;
+                let r = photocraft_engine::notes_cmds::import_notes_from(&mut app.session, &name, &bytes).map_err(|e| e.to_string());
+                if r.is_ok() {
+                    app.ui.analysis.notes = true;
+                    app.sync_views();
+                }
+                r
+            }),
+            Err(e) => Err(e),
+        },
         "measurementLog.export" => export_log(app, None),
         _ => return None,
     })
@@ -189,16 +193,17 @@ fn export_log(app: &mut PhotocraftApp, rows: Option<Vec<u64>>) -> Result<Value, 
     let p = rows.map_or(json!({}), |r| json!({"rows": r}));
     let csv = app.run("measurementLog.export", p)?;
     let text = csv["csv"].as_str().unwrap_or_default().to_string();
-    let path = app.services.pick_save.as_mut().and_then(|f| f("Measurements.csv")).ok_or("cancelled")?;
-    let write = app.services.write.as_mut().ok_or("no writer configured")?;
-    write(&path, text.as_bytes())?;
-    Ok(json!({"path": path, "rows": csv["rows"]}))
+    app.pick_save("Measurements.csv", move |app, path| {
+        let write = app.services.write.as_mut().ok_or("no writer configured")?;
+        write(&path, text.as_bytes())?;
+        Ok(json!({"path": path, "rows": csv["rows"]}))
+    })
 }
 
 // ------------------------------------------------------------------ tools
 
 fn tolerance(app: &PhotocraftApp) -> f64 {
-    7.0 / f64::from(app.current_zoom().max(0.01))
+    7.0 / f64::from(app.point_zoom().max(0.01))
 }
 
 fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
@@ -222,7 +227,7 @@ fn set_ruler(app: &mut PhotocraftApp, r: Ruler) {
 
 /// Pointer input for the Ruler, Count and Note tools. Returns true when consumed.
 pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) -> bool {
-    let tool = app.ui.tool;
+    let tool = app.active_tool();
     if !matches!(tool, Tool::Ruler | Tool::Count | Tool::Note) {
         return false;
     }
@@ -288,7 +293,7 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) ->
             }
         }
         (Tool::Note, ToolEvent::Down { x, y, .. }) => {
-            let z = f64::from(app.current_zoom().max(0.01));
+            let z = f64::from(app.point_zoom().max(0.01));
             let hit =
                 doc.notes.iter().rposition(|n| x >= n.position[0] && x <= n.position[0] + 16.0 / z && y >= n.position[1] && y <= n.position[1] + 20.0 / z);
             match hit {
@@ -452,7 +457,7 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
                     let _ = app.run("count.setGroup", json!({"group": gi, "visible": !g.visible}));
                 }
                 let mut rgb = g.color.to_rgb();
-                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                if crate::widgets::color_edit_button_rgb(ui, &mut rgb).changed() {
                     let _ = app.run("count.setGroup", json!({"group": gi, "color": [rgb[0], rgb[1], rgb[2]], "coalesce": "count-color"}));
                 }
                 if crate::icons::button(ui, "trash", 22.0, false, tl!("Delete count group")).clicked() {
@@ -483,7 +488,7 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
             ui.label(RichText::new(tl!("Author:")).color(t.text_dim).size(11.0));
             ui.add(egui::TextEdit::singleline(&mut app.ui.analysis.note_author).desired_width(120.0));
             ui.label(RichText::new(tl!("Color:")).color(t.text_dim).size(11.0));
-            ui.color_edit_button_rgb(&mut app.ui.analysis.note_color);
+            crate::widgets::color_edit_button_rgb(ui, &mut app.ui.analysis.note_color);
             if ui.add_enabled_ui(!doc.notes.is_empty(), |ui| crate::widgets::secondary_button(ui, tl!("Clear All"), 0.0)).inner.clicked() {
                 let _ = app.run("notes.delete", json!({"all": true}));
                 app.ui.analysis.note_selected = None;
@@ -579,7 +584,7 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 egui::Grid::new("mlog-grid").striped(true).spacing(vec2(10.0, 2.0)).show(ui, |ui| {
                     for c in &cols {
                         let name = photocraft_engine::analysis_cmds::COLUMNS.iter().find(|x| x.0 == *c).map_or(*c, |x| x.1);
-                        ui.label(RichText::new(name).color(t.text_dim).size(10.5).strong());
+                        ui.label(RichText::new(tl!(name)).color(t.text_dim).size(10.5).strong());
                     }
                     ui.end_row();
                     for r in &rows {
@@ -820,11 +825,14 @@ fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if crate::widgets::primary_button(ui, tl!("OK"), 70.0).clicked() {
-                        result = Some(true);
-                    }
-                    if crate::widgets::secondary_button(ui, tl!("Cancel"), 70.0).clicked() {
-                        result = Some(false);
+                    if let Some(role) = crate::widgets::dialog_buttons(
+                        ui,
+                        &[
+                            crate::widgets::DialogButton::new(crate::widgets::ButtonRole::Default, tl!("OK"), 70.0),
+                            crate::widgets::DialogButton::new(crate::widgets::ButtonRole::Cancel, tl!("Cancel"), 70.0),
+                        ],
+                    ) {
+                        result = Some(role == crate::widgets::ButtonRole::Default);
                     }
                 });
             });
@@ -896,6 +904,23 @@ pub(crate) mod tests {
             "view.proofSetup.workingCyanPlate",
         ] {
             assert!(items.iter().any(|i| i.id == id && i.enabled), "{id} live");
+        }
+    }
+
+    #[test]
+    fn arbitrary_rotation_starts_at_the_ruler_angle() {
+        let (mut app, ctx) = app();
+        let open = |app: &mut PhotocraftApp| {
+            let r = crate::menus::invoke(app, &ctx, "image.rotation.arbitrary", json!({})).unwrap();
+            let f = &app.ui.dialog_mut(r["dialog"].as_u64().unwrap()).unwrap().fields;
+            (f["angle"].as_f64().unwrap(), f["direction"].clone())
+        };
+        assert_eq!(open(&mut app), (0.0, json!("cw")));
+        // A line falling to the right straightens counter-clockwise, a near-vertical one to the y axis.
+        for (end, dir) in [([150, 60], "ccw"), ([150, 40], "cw"), ([60, -50], "ccw")] {
+            app.run("image.analysis.rulerTool", json!({"start": [50, 50], "end": end})).unwrap();
+            let (a, d) = open(&mut app);
+            assert!((a - 5.7106).abs() < 1e-3 && d == json!(dir), "{end:?}: {a} {d}");
         }
     }
 

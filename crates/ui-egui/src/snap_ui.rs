@@ -45,17 +45,18 @@ pub struct ActiveSnap {
 pub fn options(app: &PhotocraftApp) -> SnapOptions {
     let st = &app.ui.view.snap_to;
     let e = &app.ui.extras;
-    let grid_step = app.session.active().map_or(18.0, |d| {
+    let grid_step = app.session.active().map_or([18.0; 2], |d| {
         let g = &app.session.prefs().guides_grid_and_slices;
         let ppi = app.session.prefs().units_and_rulers.point_size.per_inch();
-        g.major_px(d.doc.resolution_dpi as f64, d.doc.size.width as f64, ppi) / g.subdivisions.max(1) as f64
+        crate::rulers::grid_major_px(g, d.doc.resolution_dpi.max(1.0) as f64, [d.doc.size.width as f64, d.doc.size.height as f64], ppi)
+            .map(|step| step / g.subdivisions.max(1) as f64)
     });
     SnapOptions { guides: st.guides && e.guides, grid: st.grid && e.grid, layers: st.layers, document: st.document_bounds, selection: true, grid_step }
 }
 
 /// Snap tolerance in document pixels at the current zoom.
 pub fn tolerance(app: &PhotocraftApp) -> f64 {
-    SNAP_PX / app.current_zoom().max(0.01) as f64
+    SNAP_PX / app.point_zoom().max(0.01) as f64
 }
 
 fn smart_on(app: &PhotocraftApp) -> bool {
@@ -69,14 +70,21 @@ fn snap_on(app: &PhotocraftApp) -> bool {
 /// Targets of the active document (smart = layer alignments only).
 fn build(app: &PhotocraftApp, exclude: &[LayerId], smart: bool) -> SnapTargets {
     let Some(st) = app.session.active() else { return SnapTargets::default() };
-    let opts = if smart { SnapOptions { guides: false, grid: false, layers: true, document: true, selection: false, grid_step: 0.0 } } else { options(app) };
+    let opts =
+        if smart { SnapOptions { guides: false, grid: false, layers: true, document: true, selection: false, grid_step: [0.0; 2] } } else { options(app) };
     let t = SnapTargets::from_document(&st.doc, &opts, exclude);
     if smart { t.filtered(SnapKind::is_smart) } else { t }
 }
 
-/// Union of the selected layers' bounds (what the Move tool drags).
+/// What the Move tool drags: the selection's bounds where its pixels float (`move_ui`), else the
+/// union of the selected layers' bounds.
 fn moving_rect(app: &PhotocraftApp) -> Option<[f64; 4]> {
     let st = app.session.active()?;
+    if crate::move_ui::moves_selected_pixels(app) {
+        let (dx, dy) = photocraft_engine::float_cmds::floating(st).map_or((0, 0), |f| f.offset);
+        let r = st.doc.selection.as_ref()?.content_bounds().translate(dx, dy);
+        return (!r.is_empty()).then(|| [r.x0, r.y0, r.x1, r.y1].map(f64::from));
+    }
     union(st.selected_layers().into_iter().filter_map(|id| layer_rect(&st.doc, id)))
 }
 
@@ -94,6 +102,7 @@ fn is_point_tool(t: Tool) -> bool {
             | Tool::Polygon
             | Tool::Line
             | Tool::Type
+            | Tool::VerticalType
     )
 }
 
@@ -115,7 +124,7 @@ fn in_quad(q: &[[f64; 2]; 4], p: [f64; 2]) -> bool {
     inside
 }
 
-/// Near a Free Transform corner or edge handle (within 8 screen px)?
+/// Near a Free Transform corner or edge handle (within its grab radius)?
 fn near_handle(q: &[[f64; 2]; 4], p: [f64; 2], tol: f64) -> bool {
     (0..4).any(|i| {
         let (a, b) = (q[i], q[(i + 1) % 4]);
@@ -141,7 +150,11 @@ fn begin(app: &mut PhotocraftApp, p: [f64; 2]) {
     let tool = app.ui.tool;
     let tol = tolerance(app);
     let gesture = if let Some(t) = &app.ui.transform {
-        if near_handle(&t.quad, p, tol) {
+        if t.mode == crate::state::TransformMode::Distort {
+            // Distort is freehand corner placement (fitting an image onto a screen, say): guides
+            // and edges pulling the corners about only get in the way.
+            None
+        } else if near_handle(&t.quad, p, crate::transform_tool::handle_tolerance(app)) {
             Some((Gesture::Point, vec![LayerId(t.layer)]))
         } else if in_quad(&t.quad, p) {
             Some((Gesture::TransformMove { rect: quad_rect(&t.quad) }, vec![LayerId(t.layer)]))
@@ -154,10 +167,17 @@ fn begin(app: &mut PhotocraftApp, p: [f64; 2]) {
         let exclude = app.session.active().map(|s| s.selected_layers()).unwrap_or_default();
         moving_rect(app).map(|rect| (Gesture::Move { rect }, exclude))
     } else if tool == Tool::Crop
-        && let Some(rect) = app.ui.crop_rect.filter(|r| crate::crop_ui::hit(*r, p, tol) == crate::crop_ui::Hit::Inside)
+        && let Some(rect) = app.ui.crop_rect.filter(|r| crate::crop_ui::angle(app) == 0.0 && crate::crop_ui::hit(*r, p, tol) == crate::crop_ui::Hit::Inside)
     {
         // Moving the crop frame snaps its edges, like the Move tool's layer bounds.
         Some((Gesture::Move { rect }, Vec::new()))
+    } else if tool == Tool::Crop
+        && (crate::crop_ui::turns_at(app, p)
+            || app.ui.crop_rect.is_some_and(|r| crate::crop_ui::hit_turned(r, crate::crop_ui::angle(app), p, tol) == crate::crop_ui::Hit::Inside))
+    {
+        // Turning the frame, or moving a turned one (its edges don't line up with anything): no
+        // snapping.
+        None
     } else if is_point_tool(tool) {
         Some((Gesture::Point, Vec::new()))
     } else {
@@ -383,10 +403,27 @@ mod tests {
         assert_eq!((sel.x0, sel.y0, sel.x1), (0, 0, 120));
         // Zoomed in to 800%, 4 px is beyond the 1 px threshold: no snap.
         app.ui.views[0].zoom = 8.0;
+        // (Deselect first: a drag starting inside the selection would move it.)
+        app.run("select.deselect", json!({})).unwrap();
         crate::canvas::tool_event(&mut app, ToolEvent::Down { x: 10.0, y: 10.0, pressure: 1.0 }, m);
         crate::canvas::tool_event(&mut app, ToolEvent::Up { x: 116.0, y: 50.0 }, m);
         let sel = app.session.active().unwrap().doc.selection.as_ref().unwrap().content_bounds();
         assert_eq!(sel.x1, 116);
+    }
+
+    #[test]
+    fn distort_mode_never_snaps() {
+        let mut app = app_with_box();
+        let ctx = egui::Context::default();
+        crate::menus::invoke(&mut app, &ctx, "edit.transform.distort", json!({})).unwrap();
+        let q = app.ui.transform.as_ref().unwrap().quad;
+        let m = egui::Modifiers::NONE;
+        // Drag the top-right corner to 2 px short of the target's right edge (x = 350).
+        crate::canvas::tool_event(&mut app, ToolEvent::Down { x: q[1][0], y: q[1][1], pressure: 1.0 }, m);
+        crate::canvas::tool_event(&mut app, ToolEvent::Up { x: 348.0, y: q[1][1] }, m);
+        let q = app.ui.transform.as_ref().unwrap().quad;
+        assert_eq!(q[1][0], 348.0, "the corner stays where it was dropped");
+        assert!(app.prefs_rt.snap_lines.is_empty());
     }
 
     #[test]
@@ -422,6 +459,23 @@ mod tests {
     }
 
     #[test]
+    fn percentage_grid_snaps_at_separate_axis_intervals() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 1280, "height": 720})).unwrap();
+        app.ui.extras.grid = true;
+        app.ui.view.snap_to.grid = true;
+        app.run(
+            "prefs.set",
+            json!({"values": {"guidesGridAndSlices.gridlineEvery": 20, "guidesGridAndSlices.gridUnit": "percent", "guidesGridAndSlices.subdivisions": 2}}),
+        )
+        .unwrap();
+        let opts = options(&app);
+        assert_eq!(opts.grid_step, [128.0, 72.0]);
+        let targets = SnapTargets::from_document(&app.session.active().unwrap().doc, &opts, &[]);
+        assert_eq!(targets.snap_point([127.0, 71.0], 2.0).0, [128.0, 72.0]);
+    }
+
+    #[test]
     fn grid_snapping_uses_preferences() {
         let mut app = app_with_box();
         app.ui.extras.grid = true;
@@ -430,7 +484,7 @@ mod tests {
             json!({"values": {"guidesGridAndSlices.gridlineEvery": 100, "guidesGridAndSlices.gridUnit": "pixels", "guidesGridAndSlices.subdivisions": 4}}),
         )
         .unwrap();
-        assert_eq!(options(&app).grid_step, 25.0);
+        assert_eq!(options(&app).grid_step, [25.0; 2]);
         app.ui.tool = Tool::RectMarquee;
         let m = egui::Modifiers::NONE;
         crate::canvas::tool_event(&mut app, ToolEvent::Down { x: 152.0, y: 127.0, pressure: 1.0 }, m);

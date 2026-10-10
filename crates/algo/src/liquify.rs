@@ -38,6 +38,7 @@ pub enum LiquifyTool {
     PushLeft,
     Freeze,
     Thaw,
+    LassoMask,
     /// The Reconstruct… button: scales the whole (unfrozen) field toward zero by `amount` %.
     ReconstructAll,
     /// Mask Options › Mask All / None / Invert All (whole-field freeze edits).
@@ -47,7 +48,7 @@ pub enum LiquifyTool {
 }
 
 impl LiquifyTool {
-    pub const ALL: [LiquifyTool; 10] = [
+    pub const ALL: [LiquifyTool; 11] = [
         LiquifyTool::ForwardWarp,
         LiquifyTool::Reconstruct,
         LiquifyTool::Smooth,
@@ -58,6 +59,7 @@ impl LiquifyTool {
         LiquifyTool::PushLeft,
         LiquifyTool::Freeze,
         LiquifyTool::Thaw,
+        LiquifyTool::LassoMask,
     ];
 
     pub fn label(self) -> &'static str {
@@ -72,6 +74,7 @@ impl LiquifyTool {
             LiquifyTool::PushLeft => "Push Left",
             LiquifyTool::Freeze => "Freeze Mask",
             LiquifyTool::Thaw => "Thaw Mask",
+            LiquifyTool::LassoMask => "Freeze Lasso",
             LiquifyTool::ReconstructAll => "Reconstruct All",
             LiquifyTool::FreezeAll => "Mask All",
             LiquifyTool::ThawAll => "Mask None",
@@ -86,7 +89,7 @@ impl LiquifyTool {
 
     /// Tools that act while the brush is held still (each recorded point is a dab).
     pub fn is_stationary(self) -> bool {
-        !matches!(self, LiquifyTool::ForwardWarp | LiquifyTool::PushLeft)
+        !matches!(self, LiquifyTool::ForwardWarp | LiquifyTool::PushLeft | LiquifyTool::LassoMask)
     }
 }
 
@@ -124,7 +127,8 @@ pub struct LiquifyStroke {
     pub rate: f64,
     #[serde(default)]
     pub points: Vec<Vec<f64>>,
-    /// `reconstructAll` only: how much to restore, 0..100.
+    /// `reconstructAll` only: how much to restore, 0..100. `lassoMask`: 1.0/none freezes the
+    /// polygon, 0.0 thaws it.
     #[serde(default)]
     pub amount: Option<f64>,
 }
@@ -216,6 +220,7 @@ impl LiquifyField {
     /// Applies one stroke. Returns the document rectangle whose output changed.
     pub fn apply_stroke(&mut self, s: &LiquifyStroke) -> Rect {
         match s.tool {
+            LiquifyTool::LassoMask => return self.apply_lasso(s),
             LiquifyTool::ReconstructAll => {
                 let k = (s.amount.unwrap_or(100.0) / 100.0).clamp(0.0, 1.0) as f32;
                 for (v, f) in self.d.iter_mut().zip(&self.freeze) {
@@ -242,6 +247,60 @@ impl LiquifyField {
         dirty
     }
 
+    /// Lasso: sets the freeze mask to `amount` (1.0 when none; 0.0 thaws) at every field node
+    /// inside the closed polygon in `s.points` (even-odd rule; non-finite points are skipped).
+    /// A scanline fill: each node row costs one pass over the edges, then only the nodes inside
+    /// are written. Returns the document rectangle the mask changed in.
+    fn apply_lasso(&mut self, s: &LiquifyStroke) -> Rect {
+        let poly: Vec<[f64; 2]> = s.points.iter().filter_map(|p| Some([*p.first()?, *p.get(1)?])).filter(|p| p[0].is_finite() && p[1].is_finite()).collect();
+        if poly.len() < 3 || self.w == 0 || self.h == 0 {
+            return Rect::EMPTY;
+        }
+        let (mut px0, mut py0, mut px1, mut py1) = (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for p in &poly {
+            px0 = px0.min(p[0]);
+            py0 = py0.min(p[1]);
+            px1 = px1.max(p[0]);
+            py1 = py1.max(p[1]);
+        }
+        let (_, gy0) = self.to_grid(px0, py0);
+        let (_, gy1) = self.to_grid(px1, py1);
+        let last_row = self.h.saturating_sub(1) as f64;
+        let last_col = self.w.saturating_sub(1) as f64;
+        let (j0, j1) = (gy0.ceil().max(0.0), gy1.floor().min(last_row));
+        if j1 < j0 {
+            return Rect::EMPTY;
+        }
+        let v = if s.amount.unwrap_or(1.0) > 0.5 { 1.0f32 } else { 0.0 };
+        let mut xs: Vec<f64> = Vec::new();
+        for j in (j0 as usize)..=(j1 as usize) {
+            let y = self.node_pos(0, j)[1];
+            xs.clear();
+            let Some(mut prev) = poly.last().copied() else { return Rect::EMPTY };
+            for &a in &poly {
+                if (a[1] > y) != (prev[1] > y) {
+                    xs.push(a[0] + (y - a[1]) * (prev[0] - a[0]) / (prev[1] - a[1]));
+                }
+                prev = a;
+            }
+            xs.sort_by(f64::total_cmp);
+            // Even-odd: nodes with xs[2k] <= x < xs[2k + 1] are inside.
+            for &[xa, xb] in xs.as_chunks::<2>().0 {
+                let (ga, _) = self.to_grid(xa, y);
+                let (gb, _) = self.to_grid(xb, y);
+                let (i0, i1) = (ga.ceil().max(0.0), (gb.ceil() - 1.0).min(last_col));
+                if i1 < i0 {
+                    continue;
+                }
+                let row = j * self.w;
+                if let Some(cells) = self.freeze.get_mut(row + i0 as usize..=row + i1 as usize) {
+                    cells.fill(v);
+                }
+            }
+        }
+        Rect::new(px0.floor() as i32, py0.floor() as i32, px1.ceil() as i32, py1.ceil() as i32).intersect(&self.bounds)
+    }
+
     /// Starts a stroke at `p` (`[x, y, pressure]`): stationary tools dab once there. Interactive
     /// callers use this plus [`Self::stroke_segment`] per new point, which is exactly what
     /// [`Self::apply_stroke`] does with the whole point list.
@@ -261,7 +320,10 @@ impl LiquifyField {
         let r = (s.size / 2.0).max(0.5);
         let spacing = (r * 0.2).max(0.5);
         let steps = (len / spacing).ceil().max(1.0) as usize;
-        for k in 1..=steps {
+        // Walk only the steps whose dab can reach a field node: the rest return from `dab` before
+        // touching anything, and a segment to a far-off point has trillions of them (#937).
+        let Some((k0, k1)) = self.reachable_steps(a, b, steps, r, s.tool.is_stationary()) else { return dirty };
+        for k in k0..=k1 {
             let t0 = (k - 1) as f64 / steps as f64;
             let t1 = k as f64 / steps as f64;
             let c = [a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1];
@@ -274,8 +336,44 @@ impl LiquifyField {
         dirty
     }
 
+    /// The steps `k0..=k1` of a segment walked in `steps` whose dab can touch a field node, or
+    /// `None` when none can. Step `k` centres its dab at `a + (b - a)·(k - o)/steps`, with `o` = 1
+    /// for the dragging tools and 0 for the stationary ones (see `stroke_segment`). A dab reaches a
+    /// node only when its centre is within `r` plus a node of the node grid, so the window below
+    /// pads that by another node and a step: the dabs it leaves out would each change nothing.
+    fn reachable_steps(&self, a: [f64; 3], b: [f64; 3], steps: usize, r: f64, stationary: bool) -> Option<(usize, usize)> {
+        if self.w == 0 || self.h == 0 {
+            return None;
+        }
+        let pad = r + 2.0 * self.cell;
+        let lo = [f64::from(self.bounds.x0) + 0.5 - pad, f64::from(self.bounds.y0) + 0.5 - pad];
+        let hi = [lo[0] + (self.w - 1) as f64 * self.cell + 2.0 * pad, lo[1] + (self.h - 1) as f64 * self.cell + 2.0 * pad];
+        let (n, o) = (steps as f64, if stationary { 0.0 } else { 1.0 });
+        let (mut k0, mut k1) = (1.0f64, n);
+        for ax in 0..2 {
+            let d = b[ax] - a[ax];
+            if d == 0.0 {
+                if a[ax].is_nan() || a[ax] < lo[ax] || a[ax] > hi[ax] {
+                    return None;
+                }
+                continue;
+            }
+            let (u0, u1) = ((lo[ax] - a[ax]) / d, (hi[ax] - a[ax]) / d);
+            k0 = k0.max((u0.min(u1) * n + o).floor() - 1.0);
+            k1 = k1.min((u0.max(u1) * n + o).ceil() + 1.0);
+        }
+        // NaN: a segment whose length overflowed.
+        if k0.is_nan() || k1.is_nan() || k0 > k1 {
+            return None;
+        }
+        Some((k0 as usize, k1 as usize))
+    }
+
     /// One dab at `c` with brush motion `delta`. Returns the document rect it affected.
     fn dab(&mut self, s: &LiquifyStroke, c: [f64; 2], delta: [f64; 2], point_pressure: f64) -> Rect {
+        if s.tool == LiquifyTool::LassoMask {
+            return Rect::EMPTY; // the lasso is polygon-only; never a brush dab
+        }
         let r = (s.size / 2.0).max(0.5);
         let strength = (s.pressure / 100.0).clamp(0.0, 1.0) * point_pressure;
         let rate = (s.rate / 100.0).clamp(0.0, 1.0);
@@ -680,6 +778,70 @@ mod tests {
     use super::*;
     use photocraft_color::{ColorMode, PixelFormat, SampleType};
 
+    /// The segment walk before #937: every step, whether or not its dab can reach the field.
+    fn full_walk(f: &mut LiquifyField, s: &LiquifyStroke, a: [f64; 3], b: [f64; 3]) -> Rect {
+        let mut dirty = Rect::EMPTY;
+        let (pa, pb) = (a[2].clamp(0.0, 1.0), b[2].clamp(0.0, 1.0));
+        let len = (b[0] - a[0]).hypot(b[1] - a[1]);
+        let r = (s.size / 2.0).max(0.5);
+        let steps = (len / (r * 0.2).max(0.5)).ceil().max(1.0) as usize;
+        for k in 1..=steps {
+            let (t0, t1) = ((k - 1) as f64 / steps as f64, k as f64 / steps as f64);
+            let c = [a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1];
+            let delta = [(b[0] - a[0]) * (t1 - t0), (b[1] - a[1]) * (t1 - t0)];
+            let centre = if s.tool.is_stationary() { c } else { [c[0] - delta[0], c[1] - delta[1]] };
+            dirty = dirty.union(&f.dab(s, centre, delta, pa + (pb - pa) * t1));
+        }
+        dirty
+    }
+
+    #[test]
+    fn a_segment_walks_only_the_dabs_that_can_reach_the_field() {
+        // #937: a segment to a far-off point walked one dab per spacing step along its whole
+        // length (~3e14 for 1e15 px). Skipping the dabs that can't reach a field node must leave
+        // every result bit-identical to the full walk.
+        use LiquifyTool::*;
+        let bounds = Rect::new(-7, 3, 89, 67);
+        let segments: [([f64; 3], [f64; 3]); 9] = [
+            ([10.0, 20.0, 1.0], [70.0, 50.0, 0.5]),        // inside
+            ([-900.0, 30.0, 1.0], [40.0, 31.0, 1.0]),      // in from far left
+            ([40.0, 30.0, 1.0], [40.0, 4000.0, 0.2]),      // out downwards
+            ([-500.0, -500.0, 1.0], [600.0, 600.0, 1.0]),  // diagonal through
+            ([-300.0, -9.0, 1.0], [300.0, -9.0, 1.0]),     // parallel, just above (the brush reaches)
+            ([-300.0, -400.0, 1.0], [300.0, -400.0, 1.0]), // parallel, far above (reaches nothing)
+            ([88.5, -50.0, 1.0], [88.5, 120.0, 1.0]),      // vertical, along the right edge
+            ([200.0, 200.0, 1.0], [201.0, 900.0, 1.0]),    // entirely outside
+            ([0.0, 0.0, 1.0], [0.25, 0.1, 1.0]),           // shorter than one step
+        ];
+        for tool in [ForwardWarp, PushLeft, Reconstruct, Smooth, TwirlCw, TwirlCcw, Pucker, Bloat, Freeze, Thaw] {
+            for size in [6.0, 40.0] {
+                for (a, b) in segments {
+                    let s = LiquifyStroke::new(tool, size);
+                    let (mut fast, mut full) = (LiquifyField::new(bounds, 2.0), LiquifyField::new(bounds, 2.0));
+                    // Some displacement first, so Reconstruct and Smooth have something to undo.
+                    for f in [&mut fast, &mut full] {
+                        f.stroke_segment(&LiquifyStroke::new(ForwardWarp, 30.0), [20.0, 20.0, 1.0], [60.0, 40.0, 1.0]);
+                    }
+                    let dirty = fast.stroke_segment(&s, a, b);
+                    assert_eq!(dirty, full_walk(&mut full, &s, a, b), "{tool:?} {size} {a:?} {b:?}");
+                    assert!(fast.d == full.d && fast.freeze == full.freeze, "{tool:?} {size} {a:?} {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_segment_to_a_far_off_point_returns() {
+        // The issue's request: about 3.3e14 steps before the fix. Also a segment whose length
+        // overflows f64.
+        let mut f = LiquifyField::new(Rect::new(0, 0, 24, 16), 2.0);
+        let s = LiquifyStroke::new(LiquifyTool::ForwardWarp, 30.0);
+        let dirty = f.stroke_segment(&s, [0.0, 0.0, 1.0], [1e15, 0.0, 1.0]);
+        assert!(!dirty.is_empty() && dirty.x1 <= 64, "{dirty:?}");
+        f.stroke_segment(&s, [-1e308, 5.0, 1.0], [1e308, 5.0, 1.0]);
+        f.stroke_segment(&LiquifyStroke::new(LiquifyTool::Bloat, 30.0), [5.0, -1e15, 1.0], [5.0, 1e15, 1.0]);
+    }
+
     fn sample(st: SampleType) -> Surface {
         let mut s = Surface::new(PixelFormat::new(ColorMode::Rgb, st, true));
         for y in 0..64 {
@@ -697,6 +859,85 @@ mod tests {
 
     fn worst(a: &Surface, b: &Surface, r: Rect) -> f32 {
         a.read_region(r).iter().zip(b.read_region(r)).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    }
+
+    fn lasso(points: &[[f64; 2]], amount: Option<f64>) -> LiquifyStroke {
+        let mut s = LiquifyStroke::new(LiquifyTool::LassoMask, 1.0);
+        s.points = points.iter().map(|p| p.to_vec()).collect();
+        s.amount = amount;
+        s
+    }
+
+    /// Reference even-odd test (ray casting), to check the scanline fill against.
+    fn inside(p: [f64; 2], poly: &[[f64; 2]]) -> bool {
+        let mut inside = false;
+        let mut j = poly.len() - 1;
+        for (i, a) in poly.iter().enumerate() {
+            let b = poly[j];
+            if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0] {
+                inside = !inside;
+            }
+            j = i;
+        }
+        inside
+    }
+
+    #[test]
+    fn lasso_freezes_exactly_the_nodes_inside_a_concave_polygon() {
+        // A concave "C" with a notch, at a non-integer cell size.
+        let poly = [[10.0, 8.0], [70.0, 8.0], [70.0, 20.0], [30.0, 22.5], [33.0, 40.0], [80.0, 41.0], [60.0, 58.0], [9.0, 55.0]];
+        for cell in [1.0, 2.0, 3.5] {
+            let mut f = LiquifyField::new(bounds(), cell);
+            let dirty = f.apply_stroke(&lasso(&poly, None));
+            assert_eq!(dirty, Rect::new(9, 8, 80, 58));
+            for j in 0..f.h {
+                for i in 0..f.w {
+                    let want = if inside(f.node_pos(i, j), &poly) { 1.0 } else { 0.0 };
+                    assert_eq!(f.freeze[j * f.w + i], want, "cell {cell}: node ({i}, {j}) at {:?}", f.node_pos(i, j));
+                }
+            }
+            assert!(f.freeze.contains(&1.0));
+            // Strokes replay to the same field (undo rebuilds from the list).
+            assert_eq!(LiquifyField::from_strokes(bounds(), cell, &[lasso(&poly, None)]), f);
+        }
+    }
+
+    #[test]
+    fn lasso_thaws_with_amount_zero() {
+        let mut f = LiquifyField::new(bounds(), 2.0);
+        f.apply_stroke(&LiquifyStroke::new(LiquifyTool::FreezeAll, 1.0));
+        assert!(f.freeze.iter().all(|&v| v == 1.0));
+        let square = [[20.0, 20.0], [40.0, 20.0], [40.0, 40.0], [20.0, 40.0]];
+        f.apply_stroke(&lasso(&square, Some(0.0)));
+        assert_eq!(f.freeze_at(30.0, 30.0), 0.0, "thawed inside");
+        assert_eq!(f.freeze_at(5.0, 5.0), 1.0, "still frozen outside");
+    }
+
+    #[test]
+    fn lasso_ignores_degenerate_and_hostile_polygons() {
+        let empty = LiquifyField::new(bounds(), 2.0);
+        let cases: [&[[f64; 2]]; 6] = [
+            &[],
+            &[[10.0, 10.0], [50.0, 50.0]],
+            &[[f64::NAN, 10.0], [50.0, f64::INFINITY], [20.0, 30.0]],
+            // Entirely outside the canvas, on every side.
+            &[[-50.0, -50.0], [-10.0, -50.0], [-10.0, -10.0]],
+            &[[200.0, 10.0], [300.0, 10.0], [250.0, 50.0]],
+            &[[10.0, 1e12], [50.0, 1e12], [30.0, 2e12]],
+        ];
+        for poly in cases {
+            let mut f = empty.clone();
+            assert_eq!(f.apply_stroke(&lasso(poly, None)), Rect::EMPTY, "{poly:?}");
+            assert_eq!(f, empty, "{poly:?}");
+        }
+        // Huge coordinates around the canvas clamp to it instead of overflowing.
+        let mut f = empty.clone();
+        f.apply_stroke(&lasso(&[[-1e15, -1e15], [1e15, -1e15], [1e15, 1e15], [-1e15, 1e15]], None));
+        assert!(f.freeze.iter().all(|&v| v == 1.0));
+        // A NaN point among good ones is skipped.
+        let mut f = empty.clone();
+        f.apply_stroke(&lasso(&[[10.0, 10.0], [f64::NAN, 0.0], [50.0, 10.0], [50.0, 50.0], [10.0, 50.0]], None));
+        assert_eq!(f.freeze_at(30.0, 30.0), 1.0);
     }
 
     #[test]

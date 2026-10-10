@@ -32,6 +32,9 @@ use serde_json::{Map, Value as J, json};
 
 use crate::blocks::{enum_of, get_desc, num};
 
+#[path = "camera_raw_map.rs"]
+mod camera_raw;
+
 /// Command id of a Photoshop smart filter PhotoCraft does not implement. Its params hold the
 /// filter's name, Photoshop filter id and descriptor (`psd`, hex); it renders as a pass-through.
 pub const UNSUPPORTED_FILTER: &str = "psd.unsupportedFilter";
@@ -302,7 +305,12 @@ pub fn filter_from_item(item: &Descriptor) -> SmartFilter {
     let class = fltr.map(|f| String::from_utf8_lossy(f.class_id.as_bytes()).into_owned());
     let filter_id = int(item, "filterID").unwrap_or(0);
     let class = class.or_else(|| KNOWN.iter().find(|k| k.filter_id == filter_id).map(|k| k.class.to_string()));
-    let (command, params) = match class.as_deref().and_then(|c| known_params(c, fltr)) {
+    let known = if class.as_deref() == Some(camera_raw::CLASS) {
+        camera_raw::import_params(item).map(|p| (camera_raw::COMMAND, p))
+    } else {
+        class.as_deref().and_then(|c| known_params(c, fltr))
+    };
+    let (command, params) = match known {
         Some((c, p)) => (c.to_string(), p),
         None => {
             let name = text_of(item, "Nm  ").unwrap_or_default();
@@ -364,7 +372,7 @@ fn adjustments(p: &J, curves: bool) -> Result<Value, String> {
     let allowed: &[&str] =
         if curves { &["points", "red", "green", "blue"] } else { &["inBlack", "inWhite", "gamma", "outBlack", "outWhite", "red", "green", "blue"] };
     if let Some(k) = obj.keys().find(|k| !is_meta(k) && !allowed.contains(&k.as_str())) {
-        return Err(format!("setting `{k}` has no Photoshop equivalent"));
+        return Err(format!("setting `{k}` has no PSD equivalent"));
     }
     let mut list = Vec::new();
     for (code, key) in CHANNELS {
@@ -403,7 +411,7 @@ fn fltr_for(k: &Known, p: &J) -> Result<Option<Descriptor>, String> {
     Ok(Some(match k.class {
         "GsnB" | "boxblur" | "Mdn " | "HghP" | "Mxm " | "Mnm " => {
             if p.get("preserve").and_then(J::as_str).is_some_and(|s| s == "roundness") {
-                return Err("“preserve roundness” has no Photoshop equivalent".into());
+                return Err("“preserve roundness” has no PSD equivalent".into());
             }
             d.with("Rds ", unit(b"#Pxl", pf(p, "radius", 1.0)))
         }
@@ -426,20 +434,26 @@ fn fltr_for(k: &Known, p: &J) -> Result<Option<Descriptor>, String> {
             }
             return Ok(None);
         }
-        _ => return Err("not a Photoshop filter".into()),
+        _ => return Err("not a recognized filter".into()),
     }))
 }
 
 /// The `filterFXList` item for one smart filter, or why it can't be written.
 pub fn item_for_filter(f: &SmartFilter) -> Result<Descriptor, String> {
-    if f.command == UNSUPPORTED_FILTER {
-        let raw = f.params.get("psd").and_then(J::as_str).and_then(from_hex).ok_or("its Photoshop data is missing")?;
-        let mut d = Descriptor::from_bytes(&raw).map_err(|e| format!("its Photoshop data is unreadable ({e})"))?;
+    if f.command == camera_raw::COMMAND {
+        let mut d = camera_raw::export_item(&f.params)?;
         set(&mut d, "blendOptions", blend_options(f));
         set(&mut d, "enab", Value::Boolean(f.visible));
         return Ok(d);
     }
-    let k = known_by_command(&f.command).ok_or("Photoshop has no equivalent filter")?;
+    if f.command == UNSUPPORTED_FILTER {
+        let raw = f.params.get("psd").and_then(J::as_str).and_then(from_hex).ok_or("its filter data is missing")?;
+        let mut d = Descriptor::from_bytes(&raw).map_err(|e| format!("its filter data is unreadable ({e})"))?;
+        set(&mut d, "blendOptions", blend_options(f));
+        set(&mut d, "enab", Value::Boolean(f.visible));
+        return Ok(d);
+    }
+    let k = known_by_command(&f.command).ok_or("this filter has no PSD equivalent")?;
     let fltr = fltr_for(k, &f.params)?;
     let mut d = Descriptor::new("filterFX")
         .with("Nm  ", Value::Text(UnicodeString::new_nul(k.name)))
@@ -487,6 +501,8 @@ pub struct PlacedSpec<'a> {
     pub placed: &'a str,
     /// Source pixels → document pixels.
     pub transform: Affine,
+    /// Distort / Perspective: the full projective map (row-major 3×3), overriding `transform`.
+    pub perspective: Option<[f64; 9]>,
     /// Source size in pixels.
     pub size: (f64, f64),
     /// Source resolution.
@@ -496,17 +512,32 @@ pub struct PlacedSpec<'a> {
     pub filter_fx: Option<Descriptor>,
 }
 
+/// Where the source corners land (top-left, top-right, bottom-right, bottom-left), as x, y pairs.
+fn quad_points(s: &PlacedSpec<'_>) -> [f64; 8] {
+    let (w, h) = s.size;
+    let [a, b, c, d, e, f] = s.transform.m;
+    let map = |x: f64, y: f64| match &s.perspective {
+        Some(p) => photocraft_algo::transform::Homography(*p).apply(x, y),
+        None => (a * x + c * y + e, b * x + d * y + f),
+    };
+    let mut out = [0.0; 8];
+    for (i, (x, y)) in [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)].into_iter().enumerate() {
+        (out[2 * i], out[2 * i + 1]) = map(x, y);
+    }
+    out
+}
+
 /// The transform quad: the source corners (top-left, top-right, bottom-right, bottom-left).
-fn quad(t: &Affine, (w, h): (f64, f64)) -> Value {
-    let pts = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)];
-    Value::List(
-        pts.iter()
-            .flat_map(|&(x, y)| {
-                let [a, b, c, d, e, f] = t.m;
-                [Value::Double(a * x + c * y + e), Value::Double(b * x + d * y + f)]
-            })
-            .collect(),
-    )
+fn quad(s: &PlacedSpec<'_>) -> Value {
+    Value::List(quad_points(s).into_iter().map(Value::Double).collect())
+}
+
+/// Has the placement moved from the quad a template descriptor stores (`Trnf`)?
+fn quad_moved(template: &Descriptor, s: &PlacedSpec<'_>) -> bool {
+    let Some(Value::List(pts)) = template.get("Trnf") else { return true };
+    let old: Vec<f64> = pts.iter().filter_map(|v| crate::blocks::num(Some(v))).collect();
+    let new = quad_points(s);
+    old.len() != 8 || old.iter().zip(new).any(|(a, b)| (a - b).abs() > 1e-6 * (1.0 + a.abs()))
 }
 
 fn enumv(t: &str, v: &str) -> Value {
@@ -566,17 +597,19 @@ fn pad4(mut v: Vec<u8>) -> Vec<u8> {
 }
 
 /// `SoLd` block data. With `template` (the imported descriptor) every key it has is kept and only
-/// the transform (when it moved), warp and filter stack are rewritten; otherwise a fresh
-/// descriptor in Photoshop's key order.
+/// the placed id (for a duplicate), transform (when it moved), warp and filter stack are rewritten;
+/// otherwise a fresh descriptor in Photoshop's key order.
 pub fn sold_bytes(template: Option<&Descriptor>, s: &PlacedSpec<'_>, warnings: &mut Vec<String>) -> Vec<u8> {
     let warp = warp_desc(s.warp, s.size, warnings);
     let d = match template {
         Some(t) => {
             let mut d = t.clone();
-            let moved = parse_transform(t).is_none_or(|old| old != s.transform);
-            if moved {
-                set(&mut d, "Trnf", quad(&s.transform, s.size));
-                set(&mut d, "nonAffineTransform", quad(&s.transform, s.size));
+            if text_of(t, "placed").as_deref() != Some(s.placed) {
+                set(&mut d, "placed", Value::Text(UnicodeString::new_nul(s.placed)));
+            }
+            if quad_moved(t, s) {
+                set(&mut d, "Trnf", quad(s));
+                set(&mut d, "nonAffineTransform", quad(s));
             }
             set(&mut d, "warp", warp);
             match &s.filter_fx {
@@ -597,8 +630,8 @@ pub fn sold_bytes(template: Option<&Descriptor>, s: &PlacedSpec<'_>, warnings: &
                 .with("frameCount", Value::Integer(1))
                 .with("Annt", Value::Integer(16))
                 .with("Type", Value::Integer(2))
-                .with("Trnf", quad(&s.transform, s.size))
-                .with("nonAffineTransform", quad(&s.transform, s.size))
+                .with("Trnf", quad(s))
+                .with("nonAffineTransform", quad(s))
                 .with("warp", warp)
                 .with("Sz  ", Value::Descriptor(Descriptor::new("Pnt ").with("Wdth", Value::Double(s.size.0)).with("Hght", Value::Double(s.size.1))))
                 .with("Rslt", unit(b"#Rsl", s.dpi));
@@ -627,7 +660,7 @@ pub fn plld_bytes(s: &PlacedSpec<'_>, warnings: &mut Vec<String>) -> Vec<u8> {
     for v in [1i32, 1, 16, 2] {
         out.extend_from_slice(&v.to_be_bytes());
     }
-    if let Value::List(q) = quad(&s.transform, s.size) {
+    if let Value::List(q) = quad(s) {
         for v in q {
             if let Value::Double(x) = v {
                 out.extend_from_slice(&x.to_be_bytes());
@@ -638,15 +671,6 @@ pub fn plld_bytes(s: &PlacedSpec<'_>, warnings: &mut Vec<String>) -> Vec<u8> {
     let Value::Descriptor(w) = warp_desc(s.warp, s.size, warnings) else { return pad4(out) };
     out.extend(VersionedDescriptor::new(w).to_bytes());
     pad4(out)
-}
-
-/// The transform a `soLD` descriptor stores (as [`crate::blocks::parse_smart`] reads it).
-fn parse_transform(d: &Descriptor) -> Option<Affine> {
-    let Some(Value::List(pts)) = d.get("Trnf") else { return None };
-    let sz = get_desc(d, "Sz  ")?;
-    let p: Vec<f64> = pts.iter().filter_map(|v| num(Some(v))).collect();
-    let (w, h) = (num(sz.get("Wdth"))?, num(sz.get("Hght"))?);
-    (p.len() == 8 && w > 0.0 && h > 0.0).then(|| Affine { m: [(p[2] - p[0]) / w, (p[3] - p[1]) / w, (p[6] - p[0]) / h, (p[7] - p[1]) / h, p[0], p[1]] })
 }
 
 /// The source size a `soLD` descriptor stores (`Sz  `).
@@ -768,8 +792,7 @@ fn filter_mask_item(placed: &str, mask: Option<&LayerMask>, bounds: GeomRect, sa
     FilterEffectsItem { id: placed.to_string(), version: 1, rect, depth: u32::from(depth), max_channels: 24, slots: vec![None; 26], mask: Some((rect, plane)) }
 }
 
-/// A uuid-shaped id (8-4-4-4-12 hex digits) derived from `seed`: equal contents get equal ids, so
-/// identical smart objects share one embedded file, as Photoshop's instances do.
+/// A deterministic uuid-shaped id (8-4-4-4-12 hex digits) derived from `seed`.
 pub fn uuid_from(seed: &[u8]) -> String {
     let h = blake3::hash(seed);
     let x = to_hex(&h.as_bytes()[..16]);
@@ -865,6 +888,7 @@ mod tests {
             idnt: "id-1",
             placed: "pl-2",
             transform: t,
+            perspective: None,
             size: (64.0, 32.0),
             dpi: 72.0,
             warp: None,
@@ -893,6 +917,54 @@ mod tests {
         assert_eq!(d.get("Trnf"), tmpl.get("Trnf"));
     }
 
+    /// A Distort / Perspective placement goes out as its four corners (`Trnf`, `nonAffineTransform`)
+    /// and comes back as the same projective map; an affine one reads back as no perspective.
+    #[test]
+    fn perspective_placement_round_trips_through_sold() {
+        let h = photocraft_algo::transform::Homography::rect_to_quad([0.0, 0.0, 64.0, 32.0], [[10.0, 5.0], [80.0, 8.0], [70.0, 50.0], [12.0, 40.0]]).unwrap();
+        let mut w = Vec::new();
+        let mut spec = PlacedSpec {
+            idnt: "id",
+            placed: "pl",
+            transform: Affine::IDENTITY,
+            perspective: Some(h.0),
+            size: (64.0, 32.0),
+            dpi: 72.0,
+            warp: None,
+            filter_fx: None,
+        };
+        let sold = sold_bytes(None, &spec, &mut w);
+        let back = crate::blocks::parse_smart_perspective(b"SoLd", &sold).expect("a projective placement");
+        let n = |m: [f64; 9]| m.map(|v| v / m[8]);
+        for (a, b) in n(back).iter().zip(n(h.0)) {
+            assert!((a - b).abs() < 1e-9 * (1.0 + b.abs()), "{back:?} vs {:?}", h.0);
+        }
+        // Affine placements carry no perspective.
+        spec.perspective = None;
+        spec.transform = Affine { m: [2.0, 0.0, 0.0, 2.0, 5.0, 7.0] };
+        let sold = sold_bytes(None, &spec, &mut w);
+        assert_eq!(crate::blocks::parse_smart_perspective(b"SoLd", &sold), None);
+        assert_eq!(crate::blocks::parse_smart_perspective(b"PlLd", &sold), None);
+    }
+
+    /// `quad_moved` compares the corners a template stores with the placement's: unchanged keeps
+    /// the template's quad, a moved corner (affine or projective) or a missing quad rewrites it.
+    #[test]
+    fn quad_moved_detects_corner_changes() {
+        let t = Affine { m: [1.0, 0.0, 0.0, 1.0, 3.0, 4.0] };
+        let mut w = Vec::new();
+        let mut spec = PlacedSpec { idnt: "id", placed: "pl", transform: t, perspective: None, size: (20.0, 10.0), dpi: 72.0, warp: None, filter_fx: None };
+        let template = parse_sold(&sold_bytes(None, &spec, &mut w)).expect("parses").descriptor;
+        assert!(!quad_moved(&template, &spec), "same placement");
+        spec.transform = Affine { m: [1.0, 0.0, 0.0, 1.0, 3.5, 4.0] };
+        assert!(quad_moved(&template, &spec), "moved half a pixel");
+        spec.transform = t;
+        spec.perspective =
+            photocraft_algo::transform::Homography::rect_to_quad([0.0, 0.0, 20.0, 10.0], [[3.0, 4.0], [23.0, 4.0], [20.0, 12.0], [3.0, 14.0]]).map(|h| h.0);
+        assert!(quad_moved(&template, &spec), "one corner moved (Distort)");
+        assert!(quad_moved(&Descriptor::new("null"), &spec), "no stored quad");
+    }
+
     /// Corrupted placed-layer data and filter descriptors never panic: they parse to something
     /// (unknown filters stay verbatim) or to nothing.
     #[test]
@@ -910,6 +982,7 @@ mod tests {
             idnt: "id",
             placed: "pl",
             transform: Affine::IDENTITY,
+            perspective: None,
             size: (8.0, 8.0),
             dpi: 72.0,
             warp: None,
@@ -953,7 +1026,16 @@ mod tests {
         c.mesh = Some(custom);
         for (w, back) in [(Some(arc.clone()), Some(arc)), (Some(c.clone()), Some(c)), (Some(multi), None), (None, None)] {
             let mut warnings = Vec::new();
-            let spec = PlacedSpec { idnt: "i", placed: "p", transform: Affine::IDENTITY, size: (60.0, 30.0), dpi: 72.0, warp: w.as_ref(), filter_fx: None };
+            let spec = PlacedSpec {
+                idnt: "i",
+                placed: "p",
+                transform: Affine::IDENTITY,
+                perspective: None,
+                size: (60.0, 30.0),
+                dpi: 72.0,
+                warp: w.as_ref(),
+                filter_fx: None,
+            };
             let sold = sold_bytes(None, &spec, &mut warnings);
             assert_eq!(crate::blocks::parse_placed_warp(b"SoLd", &sold), back);
             assert_eq!(warnings.len(), usize::from(w.is_some() && back.is_none()));

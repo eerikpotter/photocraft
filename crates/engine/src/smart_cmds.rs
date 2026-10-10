@@ -23,8 +23,9 @@
 use std::sync::{Arc, Mutex};
 
 use photocraft_algo::resample::translate_surface;
+use photocraft_algo::transform::Homography;
 use photocraft_color::{BlendMode, PixelFormat};
-use photocraft_doc::{DocId, Document, Layer, LayerContent, LayerId, LayerMask, Metadata, SmartObject, SmartSource};
+use photocraft_doc::{DocId, Document, Layer, LayerContent, LayerId, LayerMask, Metadata, SmartContentsId, SmartObject, SmartSource};
 use photocraft_geom::{Affine, Rect, Size};
 use photocraft_raster::Surface;
 use serde_json::{Value, json};
@@ -32,12 +33,13 @@ use serde_json::{Value, json};
 use crate::commands::{CommandSpec, blend_from_str, layer_param};
 use crate::{EngineError, Result, Session};
 
-/// An open Edit Contents document and the smart object it updates when saved or closed.
+/// An open Edit Contents document and the shared contents it updates when saved or closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SmartLink {
     pub child: DocId,
     pub parent: DocId,
     pub layer: LayerId,
+    pub contents_id: SmartContentsId,
 }
 
 /// PSD placed-layer keys that describe the smart object's source; stale once we change it.
@@ -63,7 +65,7 @@ pub fn encode_source(doc: &Document) -> Result<Vec<u8>> {
 
 /// Decodes smart-object contents (a `.pcraft` bundle, PSD/PSB, or any flat image format).
 pub fn decode_source(file_name: &str, bytes: &[u8]) -> Result<Document> {
-    photocraft_io::import(file_name, bytes).map(|r| r.document).map_err(|e| other(format!("can't read smart object contents \"{file_name}\": {e}")))
+    crate::file_cmds::import(file_name, bytes).map_err(|e| other(format!("can't read smart object contents \"{file_name}\": {e}")))
 }
 
 fn base_name(path: &str) -> String {
@@ -71,21 +73,48 @@ fn base_name(path: &str) -> String {
 }
 
 fn read_file(path: &str) -> Option<Vec<u8>> {
-    if path.is_empty() { None } else { std::fs::read(path).ok() }
+    if path.is_empty() { None } else { photocraft_format::read_file(std::path::Path::new(path)).ok() }
 }
 
 /// The source file of a smart object: embedded bytes, the PSD's embedded linked-layer data (PSD
 /// import keeps the placed layer's uuid as the path), or a linked file on disk.
 pub fn source_bytes(meta: &Metadata, src: &SmartSource) -> Option<(String, Arc<Vec<u8>>)> {
+    embedded_source_bytes(meta, src).or_else(|| match src {
+        SmartSource::Linked { path } => read_file(path).map(|b| (base_name(path), Arc::new(b))),
+        SmartSource::Embedded { .. } => None,
+    })
+}
+
+/// Memory-only resolution also covers Photoshop's embedded files addressed by a `Linked` UUID.
+fn embedded_source_bytes(meta: &Metadata, src: &SmartSource) -> Option<(String, Arc<Vec<u8>>)> {
     match src {
         SmartSource::Embedded { file_name, bytes } => Some((file_name.clone(), bytes.clone())),
-        SmartSource::Linked { path } => {
-            if let Some(f) = photocraft_io::linked::find_linked_file(meta, path) {
-                return Some((f.file_name, Arc::new(f.bytes)));
-            }
-            read_file(path).map(|b| (base_name(path), Arc::new(b)))
-        }
+        SmartSource::Linked { path } => photocraft_io::linked::find_linked_file(meta, path).map(|f| (f.file_name, Arc::new(f.bytes))),
     }
+}
+
+/// The actual path is stored in the document, not in the command's params. Recheck it before
+/// reading, reusing embedded PSD bytes rather than parsing their global blocks a second time.
+fn authorized_source_bytes(s: &Session, cmd: &str, meta: &Metadata, src: &SmartSource) -> Result<Option<(String, Arc<Vec<u8>>)>> {
+    if let Some(source) = embedded_source_bytes(meta, src) {
+        return Ok(Some(source));
+    }
+    let SmartSource::Linked { path } = src else { return Ok(None) };
+    if let Some(gate) = s.authorize {
+        gate(cmd, &json!({"path": path}))?;
+    }
+    Ok(read_file(path).map(|b| (base_name(path), Arc::new(b))))
+}
+
+/// Recheck a source's actual path before an untrusted command reads it: the path lives in the
+/// document, not in the command's params. Embedded PSD UUIDs never reach the filesystem.
+fn authorize_source(s: &Session, cmd: &str, doc: &Document, src: &SmartSource) -> Result<()> {
+    if let (Some(gate), SmartSource::Linked { path }) = (s.authorize, src)
+        && embedded_source_bytes(&doc.metadata, src).is_none()
+    {
+        gate(cmd, &json!({"path": path}))?;
+    }
+    Ok(())
 }
 
 /// A decoded, composited source in its own pixel space (`bounds` starts at the origin).
@@ -155,6 +184,33 @@ fn buffer_to_surface(buf: &photocraft_compose::Buffer, fmt: PixelFormat) -> Surf
     s
 }
 
+/// An SVG source rendered at `scale` times its own size (cached per scale), so a vector smart
+/// object stays sharp however it is placed.
+pub fn svg_source_image(bytes: &[u8], fmt: PixelFormat, scale: f64) -> Result<SourceImage> {
+    let mut h = blake3::Hasher::new();
+    h.update(bytes);
+    h.update(&scale.to_bits().to_le_bytes());
+    let key = (*h.finalize().as_bytes(), fmt);
+    if let Some(img) = cache_get(&key) {
+        return Ok(img);
+    }
+    let buf = photocraft_io::svg::rasterize(bytes, scale as f32).map_err(|e| other(format!("can't render the SVG smart object: {e}")))?;
+    let img = SourceImage { surface: Arc::new(buffer_to_surface(&buf, fmt)), bounds: buf.rect };
+    cache_put(key, img.clone());
+    Ok(img)
+}
+
+/// The scale a vector source is rasterised at for its placement: the larger axis scale of the
+/// transform in 1/16 steps (so nudges reuse the cache), between 1/16 and 64.
+fn vector_scale(sm: &SmartObject) -> f64 {
+    let [a, b, c, d, ..] = sm.transform.m;
+    let k = (a * a + b * b).sqrt().max((c * c + d * d).sqrt());
+    if !k.is_finite() {
+        return 1.0;
+    }
+    ((k * 16.0).ceil() / 16.0).clamp(1.0 / 16.0, 64.0)
+}
+
 /// The composited source image of `bytes` in pixel format `fmt` (decoded once, then cached).
 pub fn source_image(file_name: &str, bytes: &[u8], fmt: PixelFormat) -> Result<SourceImage> {
     let key = cache_key(bytes, fmt);
@@ -193,6 +249,9 @@ pub fn stack_image(file_name: &str, bytes: &[u8], fmt: PixelFormat, mode: photoc
             photocraft_compose::render_layer(&one, bounds).px
         })
         .collect();
+    if frames.is_empty() {
+        return Err(EngineError::Other("the smart object's contents have no visible layers".into()));
+    }
     let stat = match mode {
         photocraft_doc::StackMode::Entropy => Stat::Entropy,
         photocraft_doc::StackMode::Kurtosis => Stat::Kurtosis,
@@ -291,13 +350,45 @@ pub fn apply_smart_filters(placed: &Surface, sm: &SmartObject, canvas: Rect) -> 
 /// linked file, or a PSD placed layer without embedded data): callers keep the existing cache.
 pub fn render(doc: &Document, sm: &SmartObject) -> Result<Option<Surface>> {
     let Some((name, bytes)) = source_bytes(&doc.metadata, &sm.source) else { return Ok(None) };
+    // A vector source is rendered at the placement's scale, and the placement is divided by
+    // that scale so the rendered pixels land where the source units would.
+    if sm.stack_mode.is_none() && sm.warp.is_none() && photocraft_io::svg::is_svg(&bytes) {
+        let k = vector_scale(sm);
+        let img = svg_source_image(&bytes, doc.pixel_format(), k)?;
+        let placed = match &sm.perspective {
+            Some(p) => {
+                let [h0, h1, h2, h3, h4, h5, h6, h7, h8] = *p;
+                let h = Homography([h0 / k, h1 / k, h2, h3 / k, h4 / k, h5, h6 / k, h7 / k, h8]);
+                photocraft_algo::warp::place_source_projective(&img.surface, img.bounds, &h, None)
+            }
+            None => {
+                let [a, b, c, d, e, f] = sm.transform.m;
+                let t = Affine { m: [a / k, b / k, c / k, d / k, e, f] };
+                photocraft_algo::warp::place_source(&img.surface, img.bounds, &t, None)
+            }
+        };
+        return Ok(Some(apply_smart_filters(&placed, sm, doc.bounds())));
+    }
     let img = match sm.stack_mode {
         Some(mode) => stack_image(&name, &bytes, doc.pixel_format(), mode)?,
         None => source_image(&name, &bytes, doc.pixel_format())?,
     };
     // Through the warp (source space) and the transform in one pass; whole-pixel moves are exact.
-    let placed = photocraft_algo::warp::place_source(&img.surface, img.bounds, &sm.transform, sm.warp.as_ref());
+    let placed = match &sm.perspective {
+        Some(p) => photocraft_algo::warp::place_source_projective(&img.surface, img.bounds, &Homography(*p), sm.warp.as_ref()),
+        None => photocraft_algo::warp::place_source(&img.surface, img.bounds, &sm.transform, sm.warp.as_ref()),
+    };
     Ok(Some(apply_smart_filters(&placed, sm, doc.bounds())))
+}
+
+/// The smart object's pixels below smart filter `index` (the input that filter edits): the placed
+/// source and the filters under it, without the filter mask. `Ok(None)` when the source is
+/// unavailable.
+pub fn render_below_filter(doc: &Document, sm: &SmartObject, index: usize) -> Result<Option<Surface>> {
+    let mut below = sm.clone();
+    below.smart_filters.truncate(index);
+    below.filter_mask = None;
+    render(doc, &below)
 }
 
 /// Re-renders smart layer `l` (which lives in `doc`) in place. Returns false if its source is
@@ -379,9 +470,45 @@ pub(crate) fn snap_affine(a: Affine) -> Affine {
     Affine { m: a.m.map(|v| if (v - v.round()).abs() < 1e-9 { v.round() } else { v }) }
 }
 
+/// Where the smart object's source pixels land in the document: its projective map (Distort,
+/// Perspective) or its affine transform.
+pub fn placement(sm: &SmartObject) -> Homography {
+    sm.perspective.map(Homography).unwrap_or_else(|| affine_homography(&sm.transform))
+}
+
+pub(crate) fn affine_homography(a: &Affine) -> Homography {
+    let [a, b, c, d, e, f] = a.m;
+    Homography([a, c, e, b, d, f, 0.0, 0.0, 1.0])
+}
+
+/// Sets where the source lands. An affine map is stored exactly in `transform` (no
+/// `perspective`); a projective one in `perspective`, with `transform` its affine approximation at
+/// the source origin (for code that only needs scale and position).
+pub(crate) fn set_placement(sm: &mut SmartObject, h: Homography) {
+    let m = h.0;
+    let n = if m[8].abs() > 1e-12 { m.map(|v| v / m[8]) } else { m };
+    if n[6].abs() < 1e-12 && n[7].abs() < 1e-12 {
+        sm.transform = snap_affine(Affine { m: [n[0], n[3], n[1], n[4], n[2], n[5]] });
+        sm.perspective = None;
+        return;
+    }
+    let h = Homography(n);
+    let (o, x, y) = (h.apply(0.0, 0.0), h.apply(1.0, 0.0), h.apply(0.0, 1.0));
+    sm.transform = Affine { m: [x.0 - o.0, x.1 - o.1, y.0 - o.0, y.1 - o.1, o.0, o.1] };
+    sm.perspective = Some(n);
+}
+
+/// Composes `a` (document → document) onto the smart object's placement.
+pub(crate) fn transform_placement(sm: &mut SmartObject, a: &Affine) {
+    match sm.perspective {
+        None => sm.transform = snap_affine(a.mul(&sm.transform)),
+        Some(_) => set_placement(sm, affine_homography(a).mul(&placement(sm))),
+    }
+}
+
 /// Moves a smart object by whole pixels without re-rendering.
 pub(crate) fn shift_smart(sm: &mut SmartObject, dx: i32, dy: i32) {
-    sm.transform = Affine::translate(dx as f64, dy as f64).mul(&sm.transform);
+    transform_placement(sm, &Affine::translate(dx as f64, dy as f64));
     if let Some(c) = &mut sm.cache {
         *c = crate::layer_multi_cmds::shift_surface(c, dx, dy);
     }
@@ -471,6 +598,9 @@ pub fn layer_to_smart(doc: &Document, l: &Layer) -> Result<Layer> {
     sub.resolution_dpi = doc.resolution_dpi;
     sub.icc_profile = doc.icc_profile.clone();
     sub.global_light = doc.global_light;
+    // Pattern fills and pattern layer effects reference document-level patterns by ID.
+    // Preserve those resources in the embedded document before rendering or saving it.
+    sub.patterns = doc.patterns.clone();
     if any_layer(l, &|x| matches!(x.content, LayerContent::Smart(_))) {
         // Nested PSD placed layers find their embedded files here.
         sub.metadata.psd_global_blocks = doc.metadata.psd_global_blocks.clone();
@@ -519,16 +649,32 @@ pub fn layer_to_smart(doc: &Document, l: &Layer) -> Result<Layer> {
 }
 
 fn convert(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = layer_param(s, p)?;
-    s.edit("Convert to Smart Object", |doc, active| {
-        let l = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
-        let so = layer_to_smart(doc, l)?;
+    let ids = match p.get("layer").and_then(Value::as_u64) {
+        Some(id) => vec![LayerId(id)],
+        None => crate::layer_multi_cmds::selected(s),
+    };
+    let new_id = s.edit("Convert to Smart Object", |doc, active| {
+        let ids = crate::layer_multi_cmds::top_level(doc, &ids);
+        let top = *ids.last().ok_or_else(|| other("no layer selected"))?;
+        let l = doc.layer(top).ok_or(EngineError::NoLayer(top))?;
+        let so = if ids.len() == 1 {
+            layer_to_smart(doc, l)?
+        } else {
+            let children = ids.iter().map(|id| doc.layer(*id).cloned().ok_or(EngineError::NoLayer(*id))).collect::<Result<Vec<_>>>()?;
+            layer_to_smart(doc, &Layer::group(l.name.clone(), children))?
+        };
         let new_id = so.id;
-        let path = doc.path_of(id).ok_or(EngineError::NoLayer(id))?;
-        *doc.layer_at_mut(&path).ok_or(EngineError::NoLayer(id))? = so;
+        // As with Group Layers, place the result in the top selected root's parent. Insert
+        // before removal so paths shifting in other parents cannot discard unselected content.
+        doc.insert_above(Some(top), so);
+        for id in ids {
+            doc.remove(id).ok_or(EngineError::NoLayer(id))?;
+        }
         *active = Some(new_id);
-        Ok(json!({"layer": new_id.0}))
-    })
+        Ok(new_id)
+    })?;
+    crate::layer_multi_cmds::reselect(s, vec![new_id], Some(new_id));
+    Ok(json!({"layer": new_id.0}))
 }
 
 // ---------- contents ----------
@@ -538,9 +684,10 @@ fn via_copy(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit("New Smart Object via Copy", |doc, active| {
         let src = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
         let mut copy = src.duplicate();
-        copy.name = format!("{} copy", src.name);
+        copy.name = doc.copy_name(&src.name);
         if let LayerContent::Smart(sm) = &mut copy.content {
             // Independent contents: resolve to embedded bytes and drop the shared PSD uuid.
+            sm.contents_id = SmartContentsId::fresh();
             if let Some((file_name, bytes)) = source_bytes(&doc.metadata, &sm.source) {
                 sm.source = SmartSource::Embedded { file_name, bytes };
             }
@@ -558,23 +705,41 @@ fn path_param<'a>(cmd: &str, p: &'a Value) -> Result<&'a str> {
     p.get("path").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| bad(cmd, "pass `path`"))
 }
 
-/// Swaps a smart object's source, keeping its transform and filters, and re-renders.
+/// Instances sharing contents in this document, including those inside groups.
+fn instances(doc: &Document, contents_id: SmartContentsId) -> Vec<LayerId> {
+    doc.walk().into_iter().filter_map(|(_, _, l)| matches!(&l.content, LayerContent::Smart(sm) if sm.contents_id == contents_id).then_some(l.id)).collect()
+}
+
+/// Swaps shared contents, keeping each instance's transform and filters, and re-renders.
 fn set_source(s: &mut Session, p: &Value, label: &str, keep_psd: bool, make: impl FnOnce(&Metadata, &SmartSource) -> Result<SmartSource>) -> Result<Value> {
     let id = layer_param(s, p)?;
-    s.edit(label, |doc, _| {
-        let new = make(&doc.metadata, &smart(doc, id)?.source)?;
-        smart_mut(doc, id)?.source = new;
-        if !keep_psd {
-            detach_psd(doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?);
+    let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
+    let new = make(&doc.metadata, &smart(doc, id)?.source)?;
+    set_shared_source(s, id, label, keep_psd, new)
+}
+
+// Keep the shared-instance transaction out of the per-command source-builder instantiations.
+fn set_shared_source(s: &mut Session, id: LayerId, label: &str, keep_psd: bool, new: SmartSource) -> Result<Value> {
+    let (parent, contents_id) = s.edit(label, |doc, _| {
+        let contents_id = smart(doc, id)?.contents_id;
+        for instance in instances(doc, contents_id) {
+            smart_mut(doc, instance)?.source = new.clone();
+            if !keep_psd {
+                detach_psd(doc.layer_mut(instance).ok_or(EngineError::NoLayer(instance))?);
+            }
+            refresh_or_fail(doc, instance)?;
         }
-        refresh_or_fail(doc, id)?;
-        Ok(json!({"layer": id.0}))
-    })
+        Ok((doc.id, contents_id))
+    })?;
+    // An old editor must not overwrite newly replaced/relinked contents on close. Keep its
+    // document open, but the next Edit Contents opens the replacement source.
+    s.smart_links.retain(|l| l.parent != parent || l.contents_id != contents_id);
+    Ok(json!({"layer": id.0}))
 }
 
 fn replace_contents(s: &mut Session, p: &Value) -> Result<Value> {
     let path = path_param("layer.smartObjects.replaceContents", p)?.to_string();
-    let bytes = std::fs::read(&path).map_err(|e| other(format!("can't read {path}: {e}")))?;
+    let bytes = photocraft_format::read_file(std::path::Path::new(&path)).map_err(|e| other(format!("can't read {path}: {e}")))?;
     let name = base_name(&path);
     decode_source(&name, &bytes)?; // fail before touching the document
     set_source(s, p, "Replace Contents", false, |_, _| Ok(SmartSource::Embedded { file_name: name, bytes: Arc::new(bytes) }))
@@ -593,7 +758,17 @@ fn edit_contents(s: &mut Session, p: &Value) -> Result<Value> {
     let id = layer_param(s, p)?;
     let st = s.active().ok_or(EngineError::NoDocument)?;
     let parent = st.doc.id;
-    let (name, bytes) = source_bytes(&st.doc.metadata, &smart(&st.doc, id)?.source).ok_or_else(|| other("the smart object's contents are unavailable"))?;
+    let contents_id = smart(&st.doc, id)?.contents_id;
+    // Already open for editing: switch to that document rather than opening another copy.
+    if let Some(index) =
+        s.smart_links.iter().find(|l| l.parent == parent && l.contents_id == contents_id).and_then(|l| s.documents().iter().position(|d| d.doc.id == l.child))
+    {
+        s.set_active(index);
+        return Ok(json!({"document": index, "parentLayer": id.0}));
+    }
+    let source = &smart(&st.doc, id)?.source;
+    let (name, bytes) = authorized_source_bytes(s, "layer.smartObjects.editContents", &st.doc.metadata, source)?
+        .ok_or_else(|| other("the smart object's contents are unavailable"))?;
     let mut child = decode_source(&name, &bytes)?;
     // Bundles keep their document id; each open copy needs its own.
     child.id = DocId::fresh();
@@ -602,11 +777,11 @@ fn edit_contents(s: &mut Session, p: &Value) -> Result<Value> {
     // Admission may replace an ID already owned by another open document.
     let child_id = s.documents().get(index).ok_or(EngineError::NoDocument)?.doc.id;
     s.smart_links.retain(|l| l.child != child_id);
-    s.smart_links.push(SmartLink { child: child_id, parent, layer: id });
+    s.smart_links.push(SmartLink { child: child_id, parent, layer: id, contents_id });
     Ok(json!({"document": index, "parentLayer": id.0}))
 }
 
-/// Writes an Edit Contents document back into its parent smart object (one undoable step in the
+/// Writes an Edit Contents document back into all its parent instances (one undoable step in the
 /// parent) and marks it saved. Returns false if `index` isn't an Edit Contents document.
 pub fn commit_child(s: &mut Session, index: usize) -> Result<bool> {
     let Some(st) = s.docs.get(index) else { return Ok(false) };
@@ -617,14 +792,22 @@ pub fn commit_child(s: &mut Session, index: usize) -> Result<bool> {
     let prev = s.active;
     s.active = Some(parent);
     let r = s.edit("Edit Contents", |doc, _| {
-        let sm = smart_mut(doc, link.layer)?;
-        let stem = match &sm.source {
-            SmartSource::Embedded { file_name, .. } => file_name.rsplit_once('.').map_or(file_name.as_str(), |(a, _)| a).to_string(),
-            SmartSource::Linked { .. } => child.name.rsplit_once('.').map_or(child.name.as_str(), |(a, _)| a).to_string(),
-        };
-        sm.source = SmartSource::Embedded { file_name: format!("{stem}.pcraft"), bytes: bytes.clone() };
-        detach_psd(doc.layer_mut(link.layer).ok_or(EngineError::NoLayer(link.layer))?);
-        refresh_or_fail(doc, link.layer)
+        let ids = instances(doc, link.contents_id);
+        if ids.is_empty() {
+            return Err(other("the smart object's instances were removed"));
+        }
+        for id in ids {
+            let sm = smart_mut(doc, id)?;
+            let name = match &sm.source {
+                SmartSource::Embedded { file_name, .. } => file_name.as_str(),
+                SmartSource::Linked { .. } => child.name.as_str(),
+            };
+            let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+            sm.source = SmartSource::Embedded { file_name: format!("{stem}.pcraft"), bytes: bytes.clone() };
+            detach_psd(doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?);
+            refresh_or_fail(doc, id)?;
+        }
+        Ok(())
     });
     s.active = prev;
     r?;
@@ -710,7 +893,7 @@ fn set_filter_params(s: &mut Session, p: &Value) -> Result<Value> {
         let i = filter_index(CMD, p, sm)?;
         let f = &mut sm.smart_filters[i];
         if f.command == photocraft_io::smart_map::UNSUPPORTED_FILTER {
-            return Err(bad(CMD, "this Photoshop filter isn't implemented in PhotoCraft: it is kept as is (it can be hidden, moved or deleted)"));
+            return Err(bad(CMD, "this smart filter isn't implemented in PhotoCraft: it is kept as is (it can be hidden, moved or deleted)"));
         }
         match (&mut f.params, new) {
             (Value::Object(old), Value::Object(n)) => old.extend(n),
@@ -762,12 +945,30 @@ fn move_filter(s: &mut Session, p: &Value) -> Result<Value> {
 
 // ---------- enablement ----------
 
+/// Whether smart-filter or contents command `spec` can run with `p`: its precondition is checked on an
+/// explicit `"layer"` of the active document (the layer it then edits) rather than on the
+/// active layer, which stays active (#466). `None` for other commands or without that target.
+pub(crate) fn target_enabled(s: &mut Session, spec: &CommandSpec, p: &Value) -> Option<std::result::Result<(), String>> {
+    if !spec.id.starts_with("layer.smartFilter.") && !matches!(spec.id, "layer.smartObjects.editContents" | "layer.smartObjects.convertToLayers") {
+        return None;
+    }
+    let target = LayerId(p.get("layer")?.as_u64()?);
+    let d = s.active_mut()?;
+    d.doc.layer(target)?;
+    let active = d.active_layer.replace(target);
+    let r = (spec.enabled)(s);
+    if let Some(d) = s.active_mut() {
+        d.active_layer = active;
+    }
+    Some(r)
+}
+
 fn active_smart(s: &Session) -> std::result::Result<&SmartObject, String> {
     let d = s.active().ok_or("no document open")?;
     let id = d.active_layer.ok_or("no active layer")?;
     match &d.doc.layer(id).ok_or("no active layer")?.content {
         LayerContent::Smart(sm) => Ok(sm),
-        other => Err(format!("the active layer is a {} layer, not a smart object", other.kind_name())),
+        other => Err(format!("the active layer is {} {} layer, not a smart object", other.article(), other.kind_name())),
     }
 }
 fn has_smart(s: &Session) -> std::result::Result<(), String> {
@@ -806,8 +1007,22 @@ const SF: &[&str] = &["Layer", "Smart Filter"];
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        spec!("layer.smartObjects.convertToSmartObject", "Convert to Smart Object", SO, r##"{"layer":id?}"##, convertible, convert),
-        spec!("filter.convertForSmartFilters", "Convert for Smart Filters", &["Filter"], r##"{"layer":id?}"##, not_smart, convert),
+        spec!(
+            "layer.smartObjects.convertToSmartObject",
+            "Convert to Smart Object",
+            SO,
+            r##"{"layer":id?} (default: combine selected layers)"##,
+            convertible,
+            convert
+        ),
+        spec!(
+            "filter.convertForSmartFilters",
+            "Convert for Smart Filters",
+            &["Filter"],
+            r##"{"layer":id?} (default: combine selected layers)"##,
+            not_smart,
+            convert
+        ),
         spec!("layer.smartObjects.newSmartObjectViaCopy", "New Smart Object via Copy", SO, r##"{"layer":id?}"##, has_smart, via_copy),
         spec!("layer.smartObjects.rasterize", "Rasterize", SO, r##"{"layer":id?}"##, has_smart, |s, p| s.execute("layer.rasterize.smartObject", p.clone())),
         spec!(
@@ -840,6 +1055,14 @@ pub fn specs() -> Vec<CommandSpec> {
             "{}",
             |s| s.active().map(|_| ()).ok_or_else(|| "no document open".into()),
             |s, _| update_all(s)
+        ),
+        spec!(
+            "layer.smartObjects.convertToLayers",
+            "Convert to Layers",
+            SO,
+            r##"{"layer":id?} (contents unpacked at the placement: one layer, or a group named after the smart object; smart filters are discarded)"##,
+            has_smart,
+            unpack::convert_to_layers
         ),
         spec!("layer.smartObjects.convertToEmbedded", "Convert to Embedded", SO, r##"{"layer":id?}"##, has_linked, |s, p| {
             set_source(s, p, "Convert to Embedded", true, |meta, src| {
@@ -932,6 +1155,8 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!("layer.smartFilter.move", "Move Smart Filter", &[], r##"{"layer":id?,"index":u32?,"to":u32}"##, has_smart_filters, move_filter),
     ]
 }
+
+mod unpack;
 
 #[cfg(test)]
 mod tests;

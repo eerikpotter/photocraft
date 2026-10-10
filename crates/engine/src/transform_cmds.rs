@@ -2,7 +2,7 @@
 
 use photocraft_algo::transform::{Homography, Interp, warp_surface};
 use photocraft_color::PixelFormat;
-use photocraft_doc::{Document, Layer, LayerContent, LayerId};
+use photocraft_doc::{Document, Layer, LayerContent, LayerId, Locks};
 use photocraft_geom::{Affine, Rect};
 use photocraft_raster::Surface;
 use serde_json::{Value, json};
@@ -160,14 +160,21 @@ pub fn target_bounds(doc: &Document, surf: &Surface) -> Rect {
     }
 }
 
-pub(crate) fn transform_layer(doc_sel: Option<&Surface>, l: &mut Layer, h: &Homography, affine: Option<Affine>, interp: Interp) -> Result<()> {
+/// The locks `id` inherits from the groups around it.
+pub(crate) fn group_locks(doc: &Document, id: LayerId) -> Locks {
+    doc.path_of(id).and_then(|p| Some(doc.locks_at(p.split_last()?.1))).unwrap_or_default()
+}
+
+/// `group` holds the locks `l` inherits from the groups around it ([`group_locks`]).
+pub(crate) fn transform_layer(doc_sel: Option<&Surface>, group: Locks, l: &mut Layer, h: &Homography, affine: Option<Affine>, interp: Interp) -> Result<()> {
     // Photoshop turns the Background into a normal layer before transforming it.
     if l.locks.position && l.name == "Background" {
         l.locks.position = false;
         l.locks.transparency = false;
         l.name = "Layer 0".into();
     }
-    if l.locks.position || l.locks.all {
+    let locks = l.locks.union(group);
+    if locks.position || locks.all {
         return Err(EngineError::Other(format!("layer \"{}\" is locked", l.name)));
     }
     // With a selection only the selected pixels move, and so only the same region of a linked
@@ -176,7 +183,7 @@ pub(crate) fn transform_layer(doc_sel: Option<&Surface>, l: &mut Layer, h: &Homo
     match &mut l.content {
         LayerContent::Group(g) => {
             for c in g.children.iter_mut() {
-                transform_layer(None, c, h, affine, interp)?;
+                transform_layer(None, locks, c, h, affine, interp)?;
             }
         }
         LayerContent::Text(t) => {
@@ -193,11 +200,12 @@ pub(crate) fn transform_layer(doc_sel: Option<&Surface>, l: &mut Layer, h: &Homo
         }
         LayerContent::Smart(sm) => {
             // Smart objects keep the transform and re-render from their source afterwards
-            // (`refresh_text`), so repeated transforms don't degrade the pixels.
-            let Some(a) = affine else {
-                return Err(EngineError::Other("Distort and Perspective on smart objects aren't supported yet".into()));
-            };
-            sm.transform = crate::smart_cmds::snap_affine(a.mul(&sm.transform));
+            // (`refresh_text`), so repeated transforms don't degrade the pixels. Distort and
+            // Perspective keep the full projective map, so the fourth corner survives re-renders.
+            match affine {
+                Some(a) => crate::smart_cmds::transform_placement(sm, &a),
+                None => crate::smart_cmds::set_placement(sm, h.mul(&crate::smart_cmds::placement(sm))),
+            }
             // Fallback appearance for sources that can't be re-rendered.
             if let Some(c) = &mut sm.cache {
                 let src = c.content_bounds();
@@ -256,11 +264,21 @@ pub fn split_selected(surf: &Surface, sel: &Surface) -> (Surface, Surface) {
     let mut lp = px.clone();
     let mut rp = px;
     let w = src.width() as usize;
+    // A pixel the selection fully lifts out is reset to the surface's (transparent) default;
+    // keeping its colour would make `content_bounds` still count it, so the layer's bounds would
+    // include the area the pixels were moved from.
+    let mut rest_clear = rest.default_pixel();
+    if rest_clear.last().is_some_and(|a| *a > 0.0) {
+        rest_clear.fill(0.0);
+    }
     for (i, (l, r)) in lp.chunks_exact_mut(n).zip(rp.chunks_exact_mut(n)).enumerate() {
         let (x, y) = (src.x0 + (i % w) as i32, src.y0 + (i / w) as i32);
         let k = sel.sample_channel(x, y, 0);
         l[n - 1] *= k;
         r[n - 1] *= 1.0 - k;
+        if r[n - 1] <= 0.0 {
+            r.iter_mut().zip(&rest_clear).for_each(|(d, c)| *d = *c);
+        }
     }
     lifted.write_region(src, &lp);
     lifted.prune();
@@ -382,8 +400,9 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let id = id.ok_or_else(|| EngineError::Other("no active layer".into()))?;
         let is_group = doc.layer(id).is_some_and(Layer::is_group);
+        let group = group_locks(doc, id);
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-        transform_layer(if is_group { None } else { sel.as_ref() }, l, &h, affine, interp)?;
+        transform_layer(if is_group { None } else { sel.as_ref() }, group, l, &h, affine, interp)?;
         // Type layers re-render from their new transform.
         let snapshot = doc.clone();
         if let Some(l) = doc.layer_mut(id) {
@@ -480,6 +499,16 @@ mod tests {
         assert_eq!(surf.pixel(15, 65)[3], 1.0, "moved pixels land");
         let sel = st.doc.selection.as_ref().unwrap().content_bounds();
         assert_eq!((sel.y0, sel.y1), (60, 70), "selection moves too");
+    }
+
+    #[test]
+    fn with_selection_bounds_drop_the_vacated_area() {
+        // #1097: moving every pixel through a selection left transparent but coloured pixels
+        // behind, so the layer bounds were the union of the old and new positions.
+        let mut s = session();
+        s.execute("select.rect", json!({"x": 10, "y": 10, "width": 20, "height": 10})).unwrap();
+        s.execute("edit.transform", json!({"matrix": [1, 0, 0, 1, 50, 0]})).unwrap();
+        assert_eq!(active_bounds(&s), Rect::new(60, 10, 80, 20));
     }
 
     #[test]

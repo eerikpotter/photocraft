@@ -55,16 +55,32 @@ choice!(TypeUnit { Points = "points", Pixels = "pixels", Millimeters = "mm" } de
 choice!(PointSize { PostScript = "postScript", Traditional = "traditional" } default PostScript);
 choice!(Interpolation { BicubicAutomatic = "bicubicAutomatic", Nearest = "nearestNeighbor", Bilinear = "bilinear", Bicubic = "bicubic", BicubicSmoother = "bicubicSmoother", BicubicSharper = "bicubicSharper", PreserveDetails = "preserveDetails" } default BicubicAutomatic);
 choice!(ColorPicker { Adobe = "adobe", System = "system" } default Adobe);
-choice!(Theme { Pro = "pro", ProMedium = "proMedium", Studio = "studio", StudioLight = "studioLight", Classic = "classic" } default ProMedium);
+choice!(Theme { Pro = "pro", ProMedium = "proMedium", Studio = "studio", StudioLight = "studioLight", Classic = "classic", SolarizedDark = "solarizedDark", Adwaita = "adwaita", AdwaitaDark = "adwaitaDark" } default ProMedium);
+choice!(AppearanceMode { Auto = "auto", Dark = "dark", Light = "light" } default Dark);
+choice!(DarkTheme { Pro = "pro", ProMedium = "proMedium", Studio = "studio", SolarizedDark = "solarizedDark", AdwaitaDark = "adwaitaDark" } default ProMedium);
+choice!(LightTheme { StudioLight = "studioLight", Classic = "classic", Adwaita = "adwaita" } default StudioLight);
 choice!(CanvasColor { Default = "default", Black = "black", DarkGray = "darkGray", MediumGray = "mediumGray", LightGray = "lightGray", Custom = "custom" } default Default);
 choice!(CanvasBorder { DropShadow = "dropShadow", Line = "line", None = "none" } default DropShadow);
-choice!(UiScale { Auto = "auto", P100 = "100", P200 = "200" } default Auto);
+choice!(UiScale { Auto = "auto", P75 = "75", P100 = "100", P125 = "125", P150 = "150", P175 = "175", P200 = "200", P250 = "250", P300 = "300" } default Auto);
 choice!(
     /// Graphics backend of the desktop app's window and GPU canvas (applies at next launch).
     /// `auto` lets PhotoCraft pick (DX12 for Intel adapters on Windows); `cpu` composites on the
     /// CPU and draws the window with a software adapter where the platform has one. A start that
     /// crashes inside the graphics driver moves this to the next safer choice.
     GpuBackend { Auto = "auto", Vulkan = "vulkan", Dx12 = "dx12", Metal = "metal", Gl = "gl", Cpu = "cpu" } default Auto
+);
+choice!(
+    /// Rendering policy, independent of the advanced graphics backend selection.
+    /// CPU disables image acceleration; the native window may still need hardware graphics.
+    RenderingMode { Auto = "auto", Gpu = "gpu", Cpu = "cpu" } default Auto
+);
+choice!(
+    /// Linux display server of the desktop app's window (applies at next launch). `x11` runs
+    /// PhotoCraft through XWayland on a Wayland session, where native file drag and drop works
+    /// (winit 0.30 has none on Wayland, issue #386); fractional scaling may then look softer.
+    /// It needs an X server (`DISPLAY`); without one PhotoCraft starts as `auto`. Other
+    /// platforms ignore it.
+    LinuxDisplayServer { Auto = "auto", X11 = "x11" } default Auto
 );
 choice!(UiFontSize { Tiny = "tiny", Small = "small", Medium = "medium", Large = "large" } default Small);
 choice!(LogDestination { Metadata = "metadata", TextFile = "textFile", Both = "both" } default Metadata);
@@ -194,7 +210,11 @@ impl Default for General {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Interface {
+    /// Legacy single-theme preference, retained for old automation and saved settings.
     pub theme: Theme,
+    pub appearance_mode: AppearanceMode,
+    pub dark_theme: DarkTheme,
+    pub light_theme: LightTheme,
     /// Pasteboard colour in standard screen mode (`canvasCustomColor` when "custom").
     pub canvas_color: CanvasColor,
     pub canvas_custom_color: String,
@@ -211,12 +231,27 @@ pub struct Interface {
     /// Draw menu item colours set with Edit › Menus.
     pub show_menu_colors: bool,
     pub show_tooltips: bool,
+    /// Move tool drags show only the layer's outline and an arrow, leaving its pixels in place
+    /// until release. Off (the default), the pixels follow the pointer live inside the outline.
+    pub show_bounding_box_when_dragging_layer: bool,
+    /// Windows and Linux: use the system's title bar and window buttons instead of PhotoCraft's
+    /// own one-row title bar (tiling window managers, desktops that draw their own decorations;
+    /// #1271, #1316). Read when the app starts. macOS always uses the system's.
+    pub system_title_bar: bool,
+    /// Notices (the lower-right cards) hide themselves after
+    /// [`Interface::notification_duration_seconds`] unless the pointer rests on them (#2022).
+    pub notification_auto_hide: bool,
+    /// Seconds a notice stays on screen before it hides itself (Auto Hide Notifications).
+    pub notification_duration_seconds: u32,
 }
 
 impl Default for Interface {
     fn default() -> Self {
         Self {
             theme: Theme::ProMedium,
+            appearance_mode: AppearanceMode::Dark,
+            dark_theme: DarkTheme::ProMedium,
+            light_theme: LightTheme::StudioLight,
             canvas_color: CanvasColor::Default,
             canvas_custom_color: "#282828".into(),
             canvas_border: CanvasBorder::DropShadow,
@@ -227,6 +262,10 @@ impl Default for Interface {
             dynamic_color_sliders: true,
             show_menu_colors: true,
             show_tooltips: true,
+            show_bounding_box_when_dragging_layer: false,
+            system_title_bar: false,
+            notification_auto_hide: true,
+            notification_duration_seconds: 6,
         }
     }
 }
@@ -275,6 +314,9 @@ pub struct Tools {
     pub right_click_with_painting_tools: RightClickPaint,
     /// Pen tablets: pressure, tilt and rotation reach the brush (off: a pen paints like a mouse).
     pub use_tablet_pressure: bool,
+    /// Pen pressure response: `[input, output]` control points in 0..1 that the pen's pressure
+    /// passes through before it reaches any brush ([`PressureCurve`]). Linear by default.
+    pub pressure_curve: Vec<[f32; 2]>,
 }
 
 impl Default for Tools {
@@ -291,7 +333,103 @@ impl Default for Tools {
             double_click_layer_mask_launches_select_and_mask: true,
             right_click_with_painting_tools: RightClickPaint::BrushPicker,
             use_tablet_pressure: true,
+            pressure_curve: vec![[0.0, 0.0], [1.0, 1.0]],
         }
+    }
+}
+
+/// Preferences › Tools › Pressure Curve, ready to evaluate: a monotone cubic (Fritsch–Carlson)
+/// through the control points, so a firmer press never gives less pressure. The points are
+/// sanitised here, not trusted: a whole-section update or a hand-edited preferences file can store
+/// anything. Non-finite points are dropped, the rest clamped to 0..1, sorted by input (one point
+/// per input), capped at [`Self::MAX_POINTS`], and their outputs made non-decreasing; before the
+/// first point and after the last the curve stays flat. Fewer than two usable points is linear.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PressureCurve {
+    xs: Vec<f32>,
+    ys: Vec<f32>,
+    /// Tangents at the points.
+    ms: Vec<f32>,
+}
+
+impl PressureCurve {
+    pub const MAX_POINTS: usize = 16;
+
+    pub fn new(points: &[[f32; 2]]) -> Self {
+        let mut pts: Vec<[f32; 2]> =
+            points.iter().filter(|p| p[0].is_finite() && p[1].is_finite()).map(|p| [p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)]).collect();
+        pts.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        pts.dedup_by(|b, a| {
+            // Same input: keep the later point's output.
+            let same = (a[0] - b[0]).abs() < 1e-6;
+            if same {
+                a[1] = b[1];
+            }
+            same
+        });
+        pts.truncate(Self::MAX_POINTS);
+        if pts.len() < 2 {
+            pts = vec![[0.0, 0.0], [1.0, 1.0]];
+        }
+        let xs: Vec<f32> = pts.iter().map(|p| p[0]).collect();
+        let mut ys: Vec<f32> = pts.iter().map(|p| p[1]).collect();
+        for i in 1..ys.len() {
+            ys[i] = ys[i].max(ys[i - 1]);
+        }
+        // Fritsch–Carlson tangents: secant averages, zero at flat steps, limited so the cubic
+        // never overshoots (which keeps it monotone).
+        let n = xs.len();
+        let d: Vec<f32> = (0..n - 1).map(|k| (ys[k + 1] - ys[k]) / (xs[k + 1] - xs[k])).collect();
+        let mut ms = vec![0.0f32; n];
+        ms[0] = d[0];
+        ms[n - 1] = d[n - 2];
+        for k in 1..n - 1 {
+            ms[k] = if d[k - 1] * d[k] <= 0.0 { 0.0 } else { (d[k - 1] + d[k]) / 2.0 };
+        }
+        for k in 0..n - 1 {
+            if d[k] == 0.0 {
+                ms[k] = 0.0;
+                ms[k + 1] = 0.0;
+                continue;
+            }
+            let (a, b) = (ms[k] / d[k], ms[k + 1] / d[k]);
+            let s = a * a + b * b;
+            if s > 9.0 {
+                let t = 3.0 / s.sqrt();
+                ms[k] = t * a * d[k];
+                ms[k + 1] = t * b * d[k];
+            }
+        }
+        Self { xs, ys, ms }
+    }
+
+    /// The curve's output for pen pressure `x` (0..1; anything else is clamped, NaN reads as 0).
+    pub fn eval(&self, x: f32) -> f32 {
+        let x = if x.is_nan() { 0.0 } else { x.clamp(0.0, 1.0) };
+        let n = self.xs.len();
+        let (Some(&x0), Some(&xn)) = (self.xs.first(), self.xs.last()) else { return x };
+        if x <= x0 {
+            return self.ys.first().copied().unwrap_or(x);
+        }
+        if x >= xn {
+            return self.ys.last().copied().unwrap_or(x);
+        }
+        let k = self.xs.partition_point(|&v| v <= x).saturating_sub(1).min(n.saturating_sub(2));
+        let (Some(&xa), Some(&xb), Some(&ya), Some(&yb), Some(&ma), Some(&mb)) =
+            (self.xs.get(k), self.xs.get(k + 1), self.ys.get(k), self.ys.get(k + 1), self.ms.get(k), self.ms.get(k + 1))
+        else {
+            return x;
+        };
+        let h = xb - xa;
+        let t = (x - xa) / h;
+        let (t2, t3) = (t * t, t * t * t);
+        let y = (2.0 * t3 - 3.0 * t2 + 1.0) * ya + (t3 - 2.0 * t2 + t) * h * ma + (-2.0 * t3 + 3.0 * t2) * yb + (t3 - t2) * h * mb;
+        y.clamp(ya.min(yb), ya.max(yb))
+    }
+
+    /// The identity (the default curve): pressure passes through unchanged.
+    pub fn is_linear(&self) -> bool {
+        self.xs == [0.0, 1.0] && self.ys == [0.0, 1.0]
     }
 }
 
@@ -326,6 +464,8 @@ pub struct FileHandling {
     pub ignore_exif_profile_tag: bool,
     pub ask_before_saving_layered_tiff: bool,
     pub maximize_psd_compatibility: Ask,
+    /// SVG groups deeper than this are rasterised on import; parser and document safety caps remain fixed.
+    pub rasterize_svg_groups_deeper_than: u32,
     pub recent_file_count: u32,
     /// Most recently opened files, newest first (File › Open Recent).
     pub recent_files: Vec<String>,
@@ -343,6 +483,7 @@ impl Default for FileHandling {
             ignore_exif_profile_tag: false,
             ask_before_saving_layered_tiff: true,
             maximize_psd_compatibility: Ask::Always,
+            rasterize_svg_groups_deeper_than: photocraft_doc::MAX_GROUP_DEPTH as u32,
             recent_file_count: 20,
             recent_files: Vec::new(),
         }
@@ -355,6 +496,9 @@ pub struct Export {
     pub quick_export_format: QuickExportFormat,
     pub quick_export_location: ExportLocation,
     pub jpeg_quality: u32,
+    /// Keep the existing lossless Quick Export default until the user opts into lossy WebP.
+    pub webp_lossless: bool,
+    pub webp_quality: u32,
     pub metadata: ExportMetadata,
     pub convert_to_srgb: bool,
 }
@@ -365,6 +509,8 @@ impl Default for Export {
             quick_export_format: QuickExportFormat::Png,
             quick_export_location: ExportLocation::Ask,
             jpeg_quality: 85,
+            webp_lossless: true,
+            webp_quality: 85,
             metadata: ExportMetadata::Copyright,
             convert_to_srgb: true,
         }
@@ -385,14 +531,27 @@ pub struct Performance {
     pub cache_tile_size: u32,
     /// Draw the canvas with the GPU (applies at next launch).
     pub use_gpu: bool,
+    /// Explicit rendering policy. None preserves older useGpu/gpuBackend preferences.
+    pub rendering_mode: Option<RenderingMode>,
     /// Graphics backend (applies at next launch; see [`GpuBackend`]).
     pub gpu_backend: GpuBackend,
+    /// Live previews of large documents (adjustment and filter dialogs, an adjustment layer's
+    /// sliders while they drag) render on a reduced copy: fast, but blocky when zoomed in. Off:
+    /// they render at full resolution.
+    pub low_resolution_previews: bool,
+    /// Linux display server (applies at next launch; see [`LinuxDisplayServer`]).
+    pub linux_display_server: LinuxDisplayServer,
     /// Memory budget of the layer-effect cache, in MB.
     pub effect_cache_mb: u32,
     pub legacy_compositing: bool,
 }
 
 impl Performance {
+    /// Resolve old preferences without allowing legacy flags to override an explicit mode.
+    pub fn effective_rendering_mode(&self) -> RenderingMode {
+        self.rendering_mode.unwrap_or_else(|| if !self.use_gpu || self.gpu_backend == GpuBackend::Cpu { RenderingMode::Cpu } else { RenderingMode::Auto })
+    }
+
     /// Pixel memory a document and its History may hold (Memory Usage), in bytes: beyond it
     /// the oldest history states are dropped.
     pub fn history_budget_bytes(&self) -> usize {
@@ -408,7 +567,10 @@ impl Default for Performance {
             cache_levels: 4,
             cache_tile_size: 8192,
             use_gpu: true,
+            rendering_mode: None,
             gpu_backend: GpuBackend::Auto,
+            low_resolution_previews: true,
+            linux_display_server: LinuxDisplayServer::Auto,
             effect_cache_mb: 768,
             legacy_compositing: false,
         }
@@ -659,6 +821,10 @@ pub struct RawDefaults {
     pub sharpen_for: RawSharpen,
     pub open_as_smart_object: bool,
     pub apply_auto_tone: bool,
+    /// Opening a raw file interactively shows the Camera Raw dialog first (Open / Cancel), as
+    /// Photoshop does; off develops it with the defaults straight away. Automation opens never
+    /// show the dialog.
+    pub open_in_camera_raw: bool,
 }
 
 impl Default for RawDefaults {
@@ -670,6 +836,7 @@ impl Default for RawDefaults {
             sharpen_for: RawSharpen::None,
             open_as_smart_object: false,
             apply_auto_tone: false,
+            open_in_camera_raw: true,
         }
     }
 }
@@ -747,6 +914,10 @@ pub struct Preferences {
     /// The last choices of dialogs that remember them across restarts, by command id (Edit ›
     /// Fill…: `"edit.fill"` → its params). JSON owned by the shell.
     pub dialogs: BTreeMap<String, Value>,
+    /// The Brush Preset picker's remembered view: which card parts show (name, stroke, tip) and
+    /// the footer slider's card scale, saved as the user changes them and restored at launch.
+    /// JSON owned by the shell.
+    pub brush_picker: Value,
     /// File › Scripts › Script Events Manager: event → script bindings.
     pub script_events: crate::automate_cmds::ScriptEvents,
 }
@@ -782,32 +953,21 @@ pub const SECTIONS: [(&str, &str); 18] = [
 pub const HIDDEN_UNTIL_IMPLEMENTED: &[&str] = &[
     "general.colorPicker",
     "general.beepWhenDone",
-    "general.exportClipboard",
     "general.resizeImageDuringPlace",
     "general.alwaysCreateSmartObjectsWhenPlacing",
     "general.animatedZoom",
     "general.zoomResizesWindows",
-    "general.useLegacyFreeTransform",
-    "interface.uiFontSize",
-    "interface.showChannelsInColor",
     "interface.dynamicColorSliders",
     "workspace.autoCollapseIconPanels",
     "workspace.autoShowHiddenPanels",
-    "workspace.openDocumentsAsTabs",
     "workspace.enableFloatingDocumentWindowDocking",
-    "workspace.largeTabs",
     "workspace.enableNarrowOptionsBar",
-    "tools.zoomClickedPointToCenter",
     "tools.enableFlickPanning",
     "tools.varyRoundBrushHardnessOnHud",
     "tools.showTransformationValues",
-    "tools.overscroll",
-    "tools.doubleClickLayerMaskLaunchesSelectAndMask",
     "fileHandling.imagePreviews",
-    "fileHandling.lowercaseExtension",
     "fileHandling.saveInBackground",
     "fileHandling.ignoreExifProfileTag",
-    "fileHandling.askBeforeSavingLayeredTiff",
     "fileHandling.maximizePsdCompatibility",
     "performance.cacheLevels",
     "performance.effectCacheMb",
@@ -818,22 +978,18 @@ pub const HIDDEN_UNTIL_IMPLEMENTED: &[&str] = &[
     "unitsAndRulers.columnWidth",
     "unitsAndRulers.gutter",
     "unitsAndRulers.printResolution",
-    "unitsAndRulers.screenResolution",
     "plugIns.showExtensionPanels",
     "plugIns.allowScriptsToConnect",
     "plugIns.generatorEnabled",
     "type.smartQuotes",
     "type.missingGlyphProtection",
     "type.showFontNamesInEnglish",
-    "type.useEscToCommit",
     "type.textEngine",
     "type.fontPreview",
-    "type.fillNewTypeLayersWithPlaceholder",
     "type.recentFonts",
     "enhancedControls.scrubbySliderAcceleration",
     "enhancedControls.touchGestures",
     "enhancedControls.zoomWithTrackpadPinch",
-    "enhancedControls.rotateViewWithTrackpad",
     "rawDefaults.colorSpace",
     "rawDefaults.bitDepth",
     "rawDefaults.resolution",
@@ -848,8 +1004,12 @@ pub const HIDDEN_UNTIL_IMPLEMENTED: &[&str] = &[
 
 /// Is the preference at `path` (`"section.key"`) hidden from the Preferences dialog?
 pub fn is_hidden(path: &str) -> bool {
-    HIDDEN_UNTIL_IMPLEMENTED.contains(&path)
+    HIDDEN_UNTIL_IMPLEMENTED.contains(&path) || (!cfg!(target_os = "linux") && LINUX_ONLY.contains(&path))
 }
+
+/// Preferences that only do something on Linux; the dialog doesn't show them elsewhere. They
+/// still load, save and round-trip on every platform.
+pub const LINUX_ONLY: &[&str] = &["performance.linuxDisplayServer"];
 
 /// Choices of an enumerated preference (dotted path, e.g. `"cursors.painting"`).
 pub fn choices(path: &str) -> Option<&'static [&'static str]> {
@@ -857,6 +1017,9 @@ pub fn choices(path: &str) -> Option<&'static [&'static str]> {
         "general.colorPicker" => ColorPicker::NAMES,
         "general.imageInterpolation" => Interpolation::NAMES,
         "interface.theme" => Theme::NAMES,
+        "interface.appearanceMode" => AppearanceMode::NAMES,
+        "interface.darkTheme" => DarkTheme::NAMES,
+        "interface.lightTheme" => LightTheme::NAMES,
         "interface.canvasColor" => CanvasColor::NAMES,
         "interface.canvasBorder" => CanvasBorder::NAMES,
         "interface.uiScale" => UiScale::NAMES,
@@ -882,6 +1045,8 @@ pub fn choices(path: &str) -> Option<&'static [&'static str]> {
         "rawDefaults.bitDepth" => RawDepth::NAMES,
         "rawDefaults.sharpenFor" => RawSharpen::NAMES,
         "performance.gpuBackend" => GpuBackend::NAMES,
+        "performance.linuxDisplayServer" => LinuxDisplayServer::NAMES,
+        "performance.renderingMode" => RenderingMode::NAMES,
         _ => return None,
     })
 }
@@ -891,7 +1056,9 @@ pub fn range(path: &str) -> Option<(f64, f64)> {
     Some(match path {
         "fileHandling.autosaveMinutes" => (1.0, 240.0),
         "fileHandling.recentFileCount" => (0.0, 100.0),
-        "export.jpegQuality" => (1.0, 100.0),
+        "fileHandling.rasterizeSvgGroupsDeeperThan" => (0.0, photocraft_doc::MAX_GROUP_DEPTH as f64),
+        "interface.notificationDurationSeconds" => (1.0, 120.0),
+        "export.jpegQuality" | "export.webpQuality" => (1.0, 100.0),
         "performance.memoryUsageMb" => (256.0, 1_048_576.0),
         "performance.historyStates" => (1.0, 1000.0),
         "performance.cacheLevels" => (1.0, 8.0),
@@ -986,6 +1153,9 @@ fn set_path(root: &mut Value, path: &str, value: Value) -> std::result::Result<(
 
 /// Validate one value for `path` before it is stored (choices, ranges, colours).
 fn check_value(path: &str, v: &Value) -> std::result::Result<(), String> {
+    if path == "performance.renderingMode" && v.is_null() {
+        return Ok(()); // Legacy policy, resolved from useGpu and gpuBackend.
+    }
     if let Some(c) = choices(path) {
         let s = v.as_str().ok_or_else(|| format!("`{path}` must be one of {}", c.join("|")))?;
         if !c.contains(&s) {
@@ -1006,6 +1176,18 @@ fn check_value(path: &str, v: &Value) -> std::result::Result<(), String> {
     }
     if is_color(path) && v.as_str().and_then(parse_hex).is_none() {
         return Err(format!("`{path}` must be a #rrggbb colour"));
+    }
+    if path == "tools.pressureCurve" {
+        let pts = v.as_array().ok_or("`tools.pressureCurve` must be a list of [input, output] points")?;
+        if !(2..=PressureCurve::MAX_POINTS).contains(&pts.len()) {
+            return Err(format!("`tools.pressureCurve` needs 2..={} points (got {})", PressureCurve::MAX_POINTS, pts.len()));
+        }
+        for p in pts {
+            let ok = p.as_array().is_some_and(|a| a.len() == 2 && a.iter().all(|x| x.as_f64().is_some_and(|x| (0.0..=1.0).contains(&x))));
+            if !ok {
+                return Err(format!("`tools.pressureCurve` points are [input, output] pairs within 0..1 (got {p})"));
+            }
+        }
     }
     if let Some(sc) = path.strip_prefix("shortcuts.") {
         let s = v.as_str().ok_or_else(|| format!("shortcut for `{sc}` must be a string"))?;
@@ -1053,6 +1235,18 @@ impl Preferences {
             *self = Preferences::default();
             return Ok(());
         };
+        // These maps have no stored defaults; removing an override restores the fallback.
+        match keyed(path) {
+            Some(("shortcuts", id)) => {
+                self.shortcuts.remove(id);
+                return Ok(());
+            }
+            Some(("menus.colors", id)) => {
+                self.menus.colors.remove(id);
+                return Ok(());
+            }
+            _ => {}
+        }
         let def = Preferences::default().get(path).ok_or_else(|| format!("unknown preference `{path}`"))?;
         if path == "shortcuts" {
             self.shortcuts.clear();
@@ -1227,19 +1421,37 @@ impl Session {
 
     /// Everything persisted as one JSON document: the preferences plus `colorSettings`.
     pub fn prefs_to_json(&self) -> String {
+        serde_json::to_string_pretty(&self.prefs_value()).unwrap_or_default()
+    }
+
+    /// [`Session::prefs_to_json`] as a JSON tree (frontends merge it with what storage holds).
+    pub fn prefs_value(&self) -> Value {
         let mut v = self.prefs().to_json();
         if let Value::Object(m) = &mut v {
             m.insert("colorSettings".into(), serde_json::to_value(&self.color.settings).unwrap_or(Value::Null));
             m.insert("version".into(), json!(1));
             m.insert("presets".into(), self.presets.to_json(self));
         }
-        serde_json::to_string_pretty(&v).unwrap_or_default()
+        v
     }
 
     /// Restore preferences saved by [`Session::prefs_to_json`]. Missing keys keep their
     /// defaults and unknown keys are ignored, so files from older and newer versions load.
     pub fn load_prefs_json(&mut self, s: &str) -> std::result::Result<(), String> {
         let mut v: Value = serde_json::from_str(s).map_err(|e| format!("preferences: {e}"))?;
+        // Saved preferences before appearance modes had one concrete theme. Preserve its
+        // appearance instead of silently switching established users to Auto.
+        if let Some(interface) = v.get_mut("interface").and_then(Value::as_object_mut)
+            && !interface.contains_key("appearanceMode")
+            && let Some(theme) = interface.get("theme").and_then(Value::as_str).and_then(Theme::parse)
+        {
+            let (mode, slot) = match theme {
+                Theme::Pro | Theme::ProMedium | Theme::Studio | Theme::SolarizedDark | Theme::AdwaitaDark => ("dark", "darkTheme"),
+                Theme::StudioLight | Theme::Classic | Theme::Adwaita => ("light", "lightTheme"),
+            };
+            interface.insert("appearanceMode".into(), json!(mode));
+            interface.insert(slot.into(), json!(theme.name()));
+        }
         let color = v.as_object_mut().and_then(|m| m.remove("colorSettings"));
         let presets = v.as_object_mut().and_then(|m| m.remove("presets"));
         let prefs: Preferences = serde_json::from_value(v).map_err(|e| format!("preferences: {e}"))?;
@@ -1300,6 +1512,44 @@ impl Session {
         } else {
             next.set(path, value)?;
         }
+        // Old `prefs.set interface.theme` clients (by path or inside a section object) still
+        // select a visible theme.
+        if path == "interface.theme" || next.interface.theme != self.prefs().interface.theme {
+            match next.interface.theme {
+                Theme::Pro => {
+                    next.interface.dark_theme = DarkTheme::Pro;
+                    next.interface.appearance_mode = AppearanceMode::Dark;
+                }
+                Theme::ProMedium => {
+                    next.interface.dark_theme = DarkTheme::ProMedium;
+                    next.interface.appearance_mode = AppearanceMode::Dark;
+                }
+                Theme::Studio => {
+                    next.interface.dark_theme = DarkTheme::Studio;
+                    next.interface.appearance_mode = AppearanceMode::Dark;
+                }
+                Theme::StudioLight => {
+                    next.interface.light_theme = LightTheme::StudioLight;
+                    next.interface.appearance_mode = AppearanceMode::Light;
+                }
+                Theme::Classic => {
+                    next.interface.light_theme = LightTheme::Classic;
+                    next.interface.appearance_mode = AppearanceMode::Light;
+                }
+                Theme::Adwaita => {
+                    next.interface.light_theme = LightTheme::Adwaita;
+                    next.interface.appearance_mode = AppearanceMode::Light;
+                }
+                Theme::SolarizedDark => {
+                    next.interface.dark_theme = DarkTheme::SolarizedDark;
+                    next.interface.appearance_mode = AppearanceMode::Dark;
+                }
+                Theme::AdwaitaDark => {
+                    next.interface.dark_theme = DarkTheme::AdwaitaDark;
+                    next.interface.appearance_mode = AppearanceMode::Dark;
+                }
+            }
+        }
         self.prefs.edit(|p| *p = next);
         Ok(())
     }
@@ -1342,6 +1592,8 @@ fn prefs_set(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(bad(cmd, e));
         }
     }
+    // `colorSettings.blendTextGamma` lives in the compositor too, as `edit.colorSettings` sets it.
+    photocraft_compose::psblend::set_text_gamma(s.color.settings.blend_text_gamma);
     s.apply_prefs();
     let view = s.prefs_view();
     let out: Map<String, Value> = changes.iter().map(|(k, _)| (k.clone(), get_path(&view, k).cloned().unwrap_or(Value::Null))).collect();
@@ -1352,6 +1604,14 @@ fn prefs_reset(s: &mut Session, p: &Value) -> Result<Value> {
     let path = p.get("path").or_else(|| p.get("section")).and_then(Value::as_str);
     match path {
         Some("colorSettings") => s.color.settings = Default::default(),
+        // One colour setting: `Preferences` has no `colorSettings`, so take the default
+        // from `ColorSettings` and route it like `prefs.set` does.
+        Some(path) if path.starts_with("colorSettings.") => {
+            let defaults = serde_json::to_value(crate::color_cmds::ColorSettings::default()).map_err(|e| bad("prefs.reset", e.to_string()))?;
+            let key = path.strip_prefix("colorSettings.").unwrap_or(path);
+            let def = get_path(&defaults, key).cloned().ok_or_else(|| bad("prefs.reset", format!("unknown preference `{path}`")))?;
+            s.set_pref(path, def).map_err(|e| bad("prefs.reset", e))?;
+        }
         None => {
             s.color.settings = Default::default();
             s.edit_prefs(|p| p.reset(None)).map_err(|e| bad("prefs.reset", e))?;
@@ -1363,8 +1623,14 @@ fn prefs_reset(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     s.prefs.edit(|_| ());
+    photocraft_compose::psblend::set_text_gamma(s.color.settings.blend_text_gamma);
     s.apply_prefs();
-    prefs_get(s, &json!({"path": path.unwrap_or("")}))
+    if path.is_some_and(|path| keyed(path).is_some()) {
+        // The removed override is absent, so reading its old path would report an error.
+        Ok(Value::Null)
+    } else {
+        prefs_get(s, &json!({"path": path.unwrap_or("")}))
+    }
 }
 
 /// `edit.preferences.<section>`: the section's values (the GUI opens the dialog on it instead).
@@ -1389,6 +1655,38 @@ fn keyboard_shortcuts(s: &mut Session, p: &Value) -> Result<Value> {
             _ => {}
         }
     }
+    // A Photoshop `.kys` set (`importKys`, its XML text) becomes `set` entries, matched by label
+    // (`crate::kys`); a key equal to the command's default restores the default, and keys given
+    // in `set` as well win over the file's.
+    let imported;
+    let mut import = None;
+    let p = match p.get("importKys") {
+        Some(xml) => {
+            let xml = xml.as_str().ok_or_else(|| bad(cmd, "`importKys` is the text of a .kys file"))?;
+            let set = crate::kys::parse(xml).map_err(|e| bad(cmd, e))?;
+            let plan = crate::kys::plan(crate::kys::command_candidates(), &set);
+            let mut merged = serde_json::Map::new();
+            for (id, sc) in &plan.set {
+                let default = crate::command_specs().iter().find(|c| c.id == id).and_then(|c| c.shortcut).and_then(normalize_shortcut);
+                merged.insert(id.clone(), if default.as_deref() == Some(sc.as_str()) { Value::Null } else { json!(sc) });
+            }
+            merged.extend(p.get("set").and_then(Value::as_object).cloned().unwrap_or_default());
+            import = Some(json!({
+                "name": set.name,
+                "imported": plan.set.len(),
+                "set": plan.set,
+                "unknown": plan.unknown,
+                "unreadable": plan.unreadable,
+                "alternates": plan.alternates,
+                "toolKeys": set.tool_keys,
+            }));
+            let mut next = p.clone();
+            next["set"] = Value::Object(merged);
+            imported = next;
+            &imported
+        }
+        None => p,
+    };
     if let Some(m) = p.get("set").and_then(Value::as_object) {
         let mut next = s.prefs().clone();
         for (id, v) in m {
@@ -1402,7 +1700,14 @@ fn keyboard_shortcuts(s: &mut Session, p: &Value) -> Result<Value> {
             for (id, v) in m {
                 let Some(sc) = v.as_str().and_then(normalize_shortcut) else { continue };
                 for (c, def) in bindable() {
-                    if c != id && next.shortcut(c, def).and_then(normalize_shortcut).as_deref() == Some(sc.as_str()) {
+                    // Never strip a command that this same call is assigning:
+                    // two entries for one key are a clash inside the call, which
+                    // the returned conflicts list reports (#719). Stripping
+                    // each other here unbound both silently.
+                    if c == id || m.contains_key(c) {
+                        continue;
+                    }
+                    if next.shortcut(c, def).and_then(normalize_shortcut).as_deref() == Some(sc.as_str()) {
                         next.shortcuts.insert(c.to_string(), String::new());
                     }
                 }
@@ -1429,7 +1734,11 @@ fn keyboard_shortcuts(s: &mut Session, p: &Value) -> Result<Value> {
         .collect();
     let bindings: Vec<(&str, &str)> = bindable().filter_map(|(id, def)| Some((id, prefs.shortcut(id, def)?))).collect();
     let conflicts: Vec<Value> = conflicts(bindings).into_iter().map(|(sc, ids)| json!({"shortcut": sc, "commands": ids})).collect();
-    Ok(json!({"overrides": prefs.shortcuts, "commands": list, "conflicts": conflicts}))
+    let mut out = json!({"overrides": prefs.shortcuts, "commands": list, "conflicts": conflicts});
+    if let Some(import) = import {
+        out["import"] = import;
+    }
+    Ok(out)
 }
 
 /// Edit › Menus: hide/show items and give them colours.
@@ -1497,7 +1806,10 @@ macro_rules! spec {
 
 macro_rules! section {
     ($id:literal, $label:literal) => {
-        CommandSpec { id: $id, label: $label, menu: &["Edit", "Preferences"], shortcut: None, params: r##"{}"##, enabled: always, run: |s, _| preferences_section(s, &json!({"__section": section_of($id)})), journal: false }
+        section!($id, $label, None)
+    };
+    ($id:literal, $label:literal, $shortcut:expr) => {
+        CommandSpec { id: $id, label: $label, menu: &["Edit", "Preferences"], shortcut: $shortcut, params: r##"{}"##, enabled: always, run: |s, _| preferences_section(s, &json!({"__section": section_of($id)})), journal: false }
     };
 }
 
@@ -1527,7 +1839,8 @@ pub fn specs() -> Vec<CommandSpec> {
             false
         ),
         spec!("prefs.reset", "Reset Preferences", [], None, r##"{"path":"section|section.key"?=everything}"##, prefs_reset, false),
-        section!("edit.preferences.general", "General…"),
+        // Photoshop: ⌘K opens Preferences › General (⌘, is Layer › Hide Layers).
+        section!("edit.preferences.general", "General…", Some("Cmd+K")),
         section!("edit.preferences.interface", "Interface…"),
         section!("edit.preferences.workspace", "Workspace…"),
         section!("edit.preferences.tools", "Tools…"),
@@ -1550,7 +1863,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Keyboard Shortcuts…",
             ["Edit"],
             Some("Cmd+Alt+Shift+K"),
-            r##"{"set":{"<command id>|tools.temporary.hand|zoomIn|zoomOut":"Cmd+Shift+X"|""(remove)|null(default)}?,"reset":true|["<id>",…]?,"removeConflicts":bool=true,"filter":str?,"list":bool=false}"##,
+            r##"{"set":{"<command id>|tools.temporary.hand|zoomIn|zoomOut":"Cmd+Shift+X"|""(remove)|null(default)}?,"reset":true|["<id>",…]?,"removeConflicts":bool=true,"filter":str?,"list":bool=false,"importKys":"<.kys XML>"?}"##,
             keyboard_shortcuts,
             true
         ),

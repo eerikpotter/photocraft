@@ -11,7 +11,7 @@ use photocraft_doc::{CompLayerState, Document, LayerComp, LayerId};
 use serde_json::{Value, json};
 
 use crate::commands::CommandSpec;
-use crate::file_cmds::{f64_param, join, native_doc, sanitize, save_doc, stem, str_param};
+use crate::file_cmds::{SaveOpts, join, native_doc, sanitize, save_doc, stem, str_param};
 use crate::{EngineError, Result, Session};
 
 fn bad(cmd: &str, msg: impl Into<String>) -> EngineError {
@@ -40,8 +40,8 @@ fn export_comps(s: &Session) -> std::result::Result<(), String> {
 /// The comp a command acts on: `"comp"` as an id or a name, else the last applied comp.
 fn comp_param(doc: &Document, p: &Value, cmd: &str) -> Result<u32> {
     match p.get("comp") {
-        Some(Value::Number(n)) => {
-            let id = n.as_u64().ok_or_else(|| bad(cmd, "\"comp\" must be a comp id or name"))? as u32;
+        Some(v @ Value::Number(_)) => {
+            let id = crate::commands::u32_id(cmd, "comp", v)?;
             doc.comp(id).map(|c| c.id).ok_or_else(|| bad(cmd, format!("no layer comp with id {id}")))
         }
         Some(Value::String(name)) => {
@@ -78,11 +78,14 @@ pub fn apply_comp(doc: &mut Document, comp: &LayerComp, all: bool) {
             && let Some((x, y)) = st.position
             && let Some((cx, cy)) = doc.layer(id).and_then(layer_position)
             && (x, y) != (cx, cy)
+            // Recorded positions can come from files; a move that does not fit an `i32` is
+            // skipped rather than wrapped onto some other position (#1017).
+            && let (Some(dx), Some(dy)) = (x.checked_sub(cx), y.checked_sub(cy))
         {
             let snapshot = doc.clone();
             if let Some(l) = doc.layer_mut(id) {
-                crate::commands::translate_layer(&snapshot, l, x - cx, y - cy);
-                crate::vector_cmds::translate_vectors(&snapshot, l, f64::from(x - cx), f64::from(y - cy));
+                crate::commands::translate_layer(&snapshot, l, dx, dy);
+                crate::vector_cmds::translate_vectors(&snapshot, l, f64::from(dx), f64::from(dy));
             }
         }
         let Some(l) = doc.layer_mut(id) else { continue };
@@ -158,11 +161,28 @@ fn update_comp(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"updated": ids}))
 }
 
+/// Whether the live layout still matches the properties the last applied comp restores.
+/// Compare only on comp application: ordinary edits must not scan pixel bounds each frame.
+fn matches_last_comp(doc: &Document, now: &[CompLayerState]) -> bool {
+    let Some(comp) = doc.last_applied_comp.and_then(|id| doc.comp(id)) else { return false };
+    let saved: std::collections::HashMap<_, _> = comp.states.iter().map(|st| (st.layer, st)).collect();
+    now.len() == saved.len()
+        && now.iter().all(|live| {
+            saved.get(&live.layer).is_some_and(|saved| {
+                (!comp.apply_visibility || saved.visible.is_none() || saved.visible == live.visible)
+                    && (!comp.apply_position || saved.position.is_none() || saved.position == live.position)
+                    && (!comp.apply_appearance || saved.appearance.is_none() || saved.appearance == live.appearance)
+            })
+        })
+}
+
 fn apply(s: &mut Session, id: u32, label: &str) -> Result<Value> {
     s.edit(label, |doc, _| {
         let comp = doc.comp(id).cloned().ok_or_else(|| EngineError::Other(format!("no layer comp with id {id}")))?;
-        // Applying over the document's own state first remembers it as the Last Document State.
-        if doc.last_applied_comp.is_none_or(|c| doc.comp(c).is_none()) {
+        // Ordinary edits can leave last_applied_comp pointing at an outdated layout (#919).
+        // Preserve the edited layout, but keep the original backup while cycling unedited comps.
+        let states = capture_states(doc);
+        if !matches_last_comp(doc, &states) {
             doc.last_document_state = Some(LayerComp {
                 id: 0,
                 name: "Last Document State".into(),
@@ -170,7 +190,7 @@ fn apply(s: &mut Session, id: u32, label: &str) -> Result<Value> {
                 apply_visibility: true,
                 apply_position: true,
                 apply_appearance: true,
-                states: capture_states(doc),
+                states,
             });
         }
         apply_comp(doc, &comp, false);
@@ -351,7 +371,7 @@ fn comps_to_files(s: &mut Session, p: &Value) -> Result<Value> {
     let prefix = p.get("prefix").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| stem(&d.doc.name));
     let doc = d.doc.clone();
     let chosen: Vec<u32> = match p.get("comps") {
-        Some(Value::Array(a)) => a.iter().filter_map(Value::as_u64).map(|v| v as u32).collect(),
+        Some(Value::Array(a)) => a.iter().map(|v| crate::commands::u32_id(cmd, "comps", v)).collect::<Result<Vec<_>>>()?,
         _ if flag(p, "selectedOnly", false) => vec![comp_param(&doc, &json!({}), cmd)?],
         _ => doc.layer_comps.iter().map(|c| c.id).collect(),
     };
@@ -361,7 +381,7 @@ fn comps_to_files(s: &mut Session, p: &Value) -> Result<Value> {
         apply_comp(&mut one, c, false);
         one.last_applied_comp = Some(c.id);
         let path = join(&dir, &format!("{}_{:04}_{}.{format}", sanitize(&prefix), i, sanitize(&c.name)));
-        save_doc(&one, &path, f64_param(p, "quality"))?;
+        save_doc(&one, &path, SaveOpts::from_params(p))?;
         files.push(path);
     }
     if files.is_empty() {

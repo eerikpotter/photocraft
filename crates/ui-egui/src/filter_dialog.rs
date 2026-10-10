@@ -31,6 +31,9 @@ pub enum Kind {
     Grid(usize),
     /// Structured JSON (pins, curve points…): settable through the command, not shown in the dialog.
     Json,
+    /// A `"#rrggbb"` colour (`color`, or `color=#rrggbb` with a default), picked with a swatch.
+    /// Without a default the param stays unset until a colour is picked.
+    Color(Option<[f32; 3]>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -42,7 +45,7 @@ pub struct Param {
 /// Parse the registry's parameter notation, e.g.
 /// `{"radius":0.1..1000=1,"method":"spin|zoom","monochromatic":bool,"seed":u32=0,"horizontal":px=0}`.
 pub fn parse_spec(spec: &str) -> Vec<Param> {
-    let inner = spec.trim().trim_start_matches('{').trim_end_matches('}');
+    let inner = object_body(spec);
     let mut out = Vec::new();
     // Split on commas that start a new `"key":` (not inside strings or brackets).
     let mut parts: Vec<String> = Vec::new();
@@ -83,9 +86,13 @@ pub fn parse_spec(spec: &str) -> Vec<Param> {
             Kind::Bool(rest.trim_start_matches('=').trim() == "true")
         } else if v == "text" {
             Kind::Text
+        } else if v == "color" {
+            Kind::Color(None)
+        } else if let Some(default) = v.strip_prefix("color=") {
+            Kind::Color(crate::color_picker_ui::parse_hex(default))
         } else if v == "doc" {
             Kind::Document
-        } else if v == "json" || v.starts_with('[') || v.starts_with('{') {
+        } else if v == "json" || v.starts_with("layer id") || v.starts_with('[') || v.starts_with('{') {
             Kind::Json
         } else if let Some(n) = v.strip_prefix("int[").and_then(|r| r.strip_suffix(']')).and_then(|n| n.parse().ok()) {
             Kind::Grid(n)
@@ -104,6 +111,30 @@ pub fn parse_spec(spec: &str) -> Vec<Param> {
         out.push(Param { key, kind });
     }
     out
+}
+
+/// The inside of the spec's leading `{…}` object. Notes after it, like `→ {…}` results or
+/// `(per-range [c,m,y,k] arrays: …)`, are documentation: read as parameters, their commas split
+/// off junk fields and glued the note onto the last parameter (Selective Color's `"reds":json`
+/// became a number field, and its OK then failed).
+fn object_body(spec: &str) -> &str {
+    let s = spec.trim();
+    let Some(body) = s.strip_prefix('{') else { return s };
+    let (mut depth, mut in_str) = (0i32, false);
+    for (i, ch) in body.char_indices() {
+        match ch {
+            '"' => in_str = !in_str,
+            '[' | '{' if !in_str => depth += 1,
+            ']' | '}' if !in_str => {
+                if depth == 0 {
+                    return body.get(..i).unwrap_or(body);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    body.trim_end_matches('}')
 }
 
 /// Parameter keys measured in pixels (scaled for proxy previews).
@@ -125,6 +156,33 @@ fn is_pixel_param(key: &str) -> bool {
             | "blur"
             | "speed"
     )
+}
+
+/// Filters whose features have a fixed size in document pixels that no dialog parameter scales:
+/// per-pixel noise and dots (Diffuse, Mezzotint, Fibers), fixed wavelengths and brush widths
+/// (Ripple, Oil Paint) and pixel-sized geometry (Flame's length, width and interval). On a
+/// reduced proxy those features come out k times too large, so these preview at full resolution:
+/// what the preview shows is what OK applies, as in Photoshop (#2063).
+const FULL_RESOLUTION_PREVIEW: &[&str] =
+    &["filter.distort.ripple", "filter.stylize.diffuse", "filter.stylize.oilPaint", "filter.render.flame", "filter.render.fibers", "filter.pixelate.mezzotint"];
+
+/// Proxy factor for a live preview of `command` with `params`, given the document's reduced factor
+/// `k`: 1 for [`FULL_RESOLUTION_PREVIEW`] filters, otherwise the largest factor up to `k` at which
+/// no pixel-sized parameter, divided by it, drops below the command's minimum. A clamped value
+/// would change the feature size: Pointillize's 5 px cells at k = 4 became the 3 px minimum, i.e.
+/// 12 px cells in the preview (#2063).
+pub fn preview_factor(command: &str, params: &Value, k: u32) -> u32 {
+    if k <= 1 || FULL_RESOLUTION_PREVIEW.contains(&command) {
+        return 1;
+    }
+    let Some(spec) = photocraft_engine::commands::find(command) else { return k };
+    parse_spec(spec.params).into_iter().fold(k, |k, p| match p.kind {
+        Kind::Range { min, .. } if min > 0.0 && is_pixel_param(&p.key) => match params.get(&p.key).and_then(Value::as_f64) {
+            Some(v) if v.is_finite() => k.min((v / f64::from(min)).floor().clamp(1.0, f64::from(k)) as u32),
+            _ => k,
+        },
+        _ => k,
+    })
 }
 
 /// Commands outside `filter.*` that get the schema dialog *with* live preview.
@@ -162,8 +220,43 @@ pub fn has_dialog(command: &str) -> bool {
                 | "view.proofSetup"
                 | "layer.layerStyle.globalLight"
                 | "image.mode.colorTable"
+                | "edit.definePattern"
         ))
         && photocraft_engine::commands::find(command).is_some_and(|c| !parse_spec(c.params).is_empty())
+}
+
+/// Keep only portable, schema-valid choices. Never retain document ids, free-form
+/// paths, raw JSON, or values that a newer command version no longer accepts.
+fn rememberable(kind: &Kind, value: &Value) -> bool {
+    match kind {
+        Kind::Range { min, max, .. } => value.as_f64().is_some_and(|n| n.is_finite() && n >= f64::from(*min) && n <= f64::from(*max)),
+        Kind::Choice(choices) => value.as_str().is_some_and(|v| choices.iter().any(|choice| choice == v)),
+        Kind::Bool(_) => value.is_boolean(),
+        Kind::Int { .. } => value.as_i64().is_some(),
+        _ => false,
+    }
+}
+
+fn restore_remembered(app: &PhotocraftApp, command: &str, spec: &str, fields: &mut Map<String, Value>) {
+    let Some(Value::Object(saved)) = app.session.prefs().dialogs.get(command) else { return };
+    for p in parse_spec(spec) {
+        if let Some(v) = saved.get(&p.key).filter(|v| rememberable(&p.kind, v)) {
+            fields.insert(p.key, v.clone());
+        }
+    }
+}
+
+/// Remember successful built-in schema dialogs; failed or cancelled dialogs do not persist.
+pub(crate) fn remember(app: &mut PhotocraftApp, command: &str, fields: &Map<String, Value>) {
+    if !fields.contains_key("__filter") || fields.contains_key("__spec") {
+        return;
+    }
+    let Some(spec) = photocraft_engine::commands::find(command) else { return };
+    let saved: Map<String, Value> =
+        parse_spec(spec.params).into_iter().filter_map(|p| fields.get(&p.key).filter(|v| rememberable(&p.kind, v)).map(|v| (p.key, v.clone()))).collect();
+    if !saved.is_empty() {
+        app.session.prefs.edit(|prefs| prefs.dialogs.insert(command.into(), Value::Object(saved)));
+    }
 }
 
 pub fn open(app: &mut PhotocraftApp, command: &str) -> Option<u64> {
@@ -177,6 +270,7 @@ pub fn open(app: &mut PhotocraftApp, command: &str) -> Option<u64> {
     }
     for p in parse_spec(spec.params) {
         let v = match &p.kind {
+            Kind::Range { default, .. } if command == "image.mode.indexedColor" && p.key == "colors" => json!(default.round().clamp(2.0, 256.0) as u32),
             Kind::Range { default, .. } => json!(default),
             Kind::Choice(c) => json!(c.first().cloned().unwrap_or_default()),
             Kind::Bool(default) => json!(default),
@@ -185,12 +279,22 @@ pub fn open(app: &mut PhotocraftApp, command: &str) -> Option<u64> {
             Kind::Document => json!(-1),
             // Identity kernel: 1 in the centre.
             Kind::Grid(n) => json!((0..*n).map(|i| i64::from(i == *n / 2)).collect::<Vec<_>>()),
+            Kind::Color(Some(rgb)) => json!(crate::color_picker_ui::hex(*rgb)),
+            Kind::Color(None) => continue,
             // Colour inputs come from the current swatches, so the proxy preview matches the result.
             Kind::Json if p.key == "foreground" => json!(app.session.tools.foreground),
             Kind::Json if p.key == "background" => json!(app.session.tools.background),
             Kind::Json => continue,
         };
         fields.insert(p.key, v);
+    }
+    restore_remembered(app, command, spec.params, &mut fields);
+    if command == "image.rotation.arbitrary" {
+        straighten_defaults(app, &mut fields);
+    }
+    // Photoshop's Pattern Name dialog starts from the name the pattern would get anyway.
+    if command == "edit.definePattern" {
+        fields.insert("name".into(), json!(photocraft_engine::pattern_cmds::default_name(&app.session)));
     }
     if parse_spec(spec.params).iter().any(|p| p.kind == Kind::Document) {
         // The document picker lists every open document (params refer to them by index).
@@ -199,6 +303,18 @@ pub fn open(app: &mut PhotocraftApp, command: &str) -> Option<u64> {
     }
     let id = app.ui.open_dialog(crate::state::DialogKind::Command, fields);
     Some(id)
+}
+
+/// Arbitrary rotation starts at the angle that straightens the ruler line, when there is one.
+fn straighten_defaults(app: &PhotocraftApp, fields: &mut Map<String, Value>) {
+    let Some(r) = app.session.active().and_then(|d| d.doc.measurement.ruler) else { return };
+    let rot = photocraft_engine::analysis_cmds::straighten_angle(&r);
+    // A ruler read from a damaged file could hold non-finite ends: keep the 0° default then.
+    if !rot.is_finite() {
+        return;
+    }
+    fields.insert("angle".into(), json!(rot.abs()));
+    fields.insert("direction".into(), json!(if rot < 0.0 { "ccw" } else { "cw" }));
 }
 
 /// A filter dialog with live preview for `command` whose parameters follow `spec` (registry
@@ -216,6 +332,7 @@ pub fn open_with_spec(app: &mut PhotocraftApp, command: &str, label: &str, spec:
             Kind::Choice(c) => json!(c.first().cloned().unwrap_or_default()),
             Kind::Bool(default) => json!(default),
             Kind::Int { default } => json!(default),
+            Kind::Color(Some(rgb)) => json!(crate::color_picker_ui::hex(*rgb)),
             _ => continue,
         };
         fields.insert(p.key, v);
@@ -224,6 +341,10 @@ pub fn open_with_spec(app: &mut PhotocraftApp, command: &str, label: &str, spec:
 }
 
 pub(crate) fn label(key: &str) -> String {
+    tl!(&source_label(key)).to_owned()
+}
+
+pub(crate) fn source_label(key: &str) -> String {
     // camelCase → "Camel Case"
     let mut s = String::new();
     for (i, ch) in key.chars().enumerate() {
@@ -263,6 +384,12 @@ pub fn body(ui: &mut egui::Ui, f: &mut Map<String, Value>) {
         match p.kind {
             Kind::Range { min, max, default } => {
                 let mut v = f.get(&p.key).and_then(Value::as_f64).unwrap_or(default as f64) as f32;
+                if cmd == "image.mode.indexedColor" && p.key == "colors" {
+                    let mut count = v.round().clamp(2.0, 256.0) as u32;
+                    crate::widgets::color_count_row(ui, &label(&p.key), &mut count);
+                    f.insert(p.key, json!(count));
+                    continue;
+                }
                 let unit = if is_pixel_param(&p.key) {
                     "px"
                 } else if p.key == "angle" {
@@ -289,7 +416,9 @@ pub fn body(ui: &mut egui::Ui, f: &mut Map<String, Value>) {
                 } else {
                     crate::widgets::slider_row(ui, &label(&p.key), &mut v, min..=max, unit, None);
                 }
-                f.insert(p.key, json!((v * 10.0).round() / 10.0));
+                // Small ranges (0–1 thresholds and centres) keep the two decimals their field shows.
+                let scale = if max - min <= 10.0 { 100.0 } else { 10.0 };
+                f.insert(p.key, json!((v * scale).round() / scale));
             }
             Kind::Choice(options) => {
                 ui.horizontal(|ui| {
@@ -351,6 +480,25 @@ pub fn body(ui: &mut egui::Ui, f: &mut Map<String, Value>) {
                 f.insert(p.key, json!(vals.iter().map(|v| v.round() as i64).collect::<Vec<_>>()));
             }
             Kind::Json => {}
+            Kind::Color(default) => {
+                let set = f.get(&p.key).and_then(Value::as_str).and_then(crate::color_picker_ui::parse_hex);
+                let rgb = set.or(default).unwrap_or([0.0; 3]);
+                let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let mut bytes = rgb.map(q);
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(label(&p.key)).color(t.text_dim));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        changed = crate::widgets::color_edit_button_srgb(ui, &mut bytes).changed();
+                        ui.label(egui::RichText::new(crate::color_picker_ui::hex(rgb)).color(t.text_dim).monospace());
+                    });
+                });
+                if changed {
+                    f.insert(p.key, json!(crate::color_picker_ui::hex(bytes.map(|b| f32::from(b) / 255.0))));
+                } else if set.is_none() && default.is_some() {
+                    f.insert(p.key, json!(crate::color_picker_ui::hex(rgb)));
+                }
+            }
             Kind::Int { default } => {
                 let mut v = f.get(&p.key).and_then(Value::as_f64).unwrap_or(default as f64) as f32;
                 ui.horizontal(|ui| {
@@ -360,6 +508,11 @@ pub fn body(ui: &mut egui::Ui, f: &mut Map<String, Value>) {
                 f.insert(p.key, json!(v.round() as i64));
             }
         }
+    }
+    // Read-only context the dialog opener supplies (e.g. the monitor profile in use).
+    if let Some(note) = f.get("__note").and_then(Value::as_str) {
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(egui::RichText::new(note).color(t.text_dim)).wrap());
     }
     if let Some(mut preview) = f.get("__preview").and_then(Value::as_bool) {
         ui.add_space(4.0);
@@ -377,8 +530,22 @@ pub fn params_of(f: &Map<String, Value>) -> Value {
 
 /// Compute a preview document: run `command` with `params` on the proxy (scaled) copy of `doc`.
 pub fn preview_document(doc: &Document, active: Option<photocraft_doc::LayerId>, command: &str, params: &Value, k: u32) -> Option<Document> {
+    preview_document_with(doc, active, command, params, k, None)
+}
+
+/// [`preview_document`] whose filter stops early, giving `None`, once `cancel` is cancelled
+/// (a preview superseded by newer dialog values).
+pub fn preview_document_with(
+    doc: &Document,
+    active: Option<photocraft_doc::LayerId>,
+    command: &str,
+    params: &Value,
+    k: u32,
+    cancel: Option<&photocraft_engine::jobs::JobCtx>,
+) -> Option<Document> {
     let proxy = crate::proxy::proxy_document(doc, k);
     let mut s = photocraft_engine::Session::new();
+    s.set_inline_job_ctx(cancel.cloned());
     s.add_document(proxy, None);
     if let Some(id) = active {
         s.select_layer(id).ok()?;
@@ -387,11 +554,19 @@ pub fn preview_document(doc: &Document, active: Option<photocraft_doc::LayerId>,
     if k > 1
         && let Some(o) = p.as_object_mut()
     {
+        let spec = photocraft_engine::commands::find(command).map(|c| parse_spec(c.params)).unwrap_or_default();
         for (key, v) in o.iter_mut() {
             if is_pixel_param(key)
                 && let Some(x) = v.as_f64()
             {
-                *v = json!((x / k as f64).max(if key == "cellSize" { 1.0 } else { 0.1 }));
+                // Match the engine's minimum after scaling (e.g. Box Blur 1, Mosaic 2).
+                // Previously its tolerant decoder clamped these; new calls validate first.
+                let minimum = spec.iter().find(|p| p.key == key.as_str()).and_then(|p| match &p.kind {
+                    Kind::Range { min, .. } => Some(f64::from(*min)),
+                    _ => None,
+                });
+                let floor = minimum.unwrap_or(0.0).max(if key == "cellSize" { 1.0 } else { 0.1 });
+                *v = json!((x / k as f64).max(floor));
             }
         }
     }
@@ -401,16 +576,61 @@ pub fn preview_document(doc: &Document, active: Option<photocraft_doc::LayerId>,
 
 /// Cached preview state on the app.
 pub struct FilterPreview {
+    pub key: FilterPreviewKey,
+    pub result: Option<Arc<Document>>,
+    /// OK was pressed and the filter runs as a background job: the preview stays on screen until
+    /// the job lands, so the canvas doesn't flash the unfiltered image in between.
+    pub committing: bool,
+}
+
+/// Match the full request before accepting a worker result, including a reopened dialog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilterPreviewKey {
     pub doc: photocraft_doc::DocId,
     pub revision: u64,
-    pub hash: u64,
+    pub dialog: u64,
+    pub active: Option<photocraft_doc::LayerId>,
+    pub command: String,
+    pub params: Value,
     pub k: u32,
-    pub result: Option<Arc<Document>>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restores_only_valid_previous_filter_choices() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+        app.session.prefs.edit(|prefs| {
+            prefs.dialogs.insert("filter.blur.gaussianBlur".into(), json!({"radius": 11.0, "bogus": 42}));
+        });
+        open(&mut app, "filter.blur.gaussianBlur").unwrap();
+        let fields = &app.ui.dialogs.last().unwrap().fields;
+        assert_eq!(fields["radius"], json!(11.0));
+        assert!(!fields.contains_key("bogus"));
+
+        // A changed registry range, corrupt preference or stale path is never restored.
+        let mut fields = Map::new();
+        fields.insert("radius".into(), json!(2.0));
+        restore_remembered(&app, "filter.blur.gaussianBlur", r#"{"radius":0.1..5=1}"#, &mut fields);
+        assert_eq!(fields["radius"], json!(2.0));
+    }
+
+    #[test]
+    fn remembering_dialogs_never_persists_paths_or_document_indices() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+        let mut fields = Map::new();
+        fields.insert("__filter".into(), json!(true));
+        fields.insert("radius".into(), json!(7.0));
+        fields.insert("mapPath".into(), json!("/private/file"));
+        fields.insert("document".into(), json!(5));
+        remember(&mut app, "filter.blur.gaussianBlur", &fields);
+        let saved = &app.session.prefs().dialogs["filter.blur.gaussianBlur"];
+        assert_eq!(saved["radius"], json!(7.0));
+        assert!(saved.get("mapPath").is_none());
+        assert!(saved.get("document").is_none());
+    }
 
     #[test]
     fn parses_registry_notation() {
@@ -427,6 +647,35 @@ mod tests {
             kinds,
             [&Kind::Bool(true), &Kind::Grid(25), &Kind::Json, &Kind::Json, &Kind::Text, &Kind::Document, &Kind::Range { min: 1.0, max: 9999.0, default: 1.0 }]
         );
+    }
+
+    /// A layer-id param has no number field: drawing the Auto-Align dialog used to write
+    /// `reference: 0` back, which the engine rejects as not a selected layer (#674).
+    #[test]
+    fn layer_id_params_stay_out_of_the_dialog() {
+        let mut f = Map::new();
+        f.insert("__command".into(), json!("edit.autoAlignLayers"));
+        egui::Context::default().run_ui(Default::default(), |ui| body(ui, &mut f)).textures_delta.clear();
+        assert!(!params_of(&f).as_object().unwrap().contains_key("reference"), "{f:?}");
+    }
+
+    #[test]
+    fn indexed_counts_are_integer_json_while_dither_amounts_keep_their_decimals() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+        open(&mut app, "image.mode.indexedColor").unwrap();
+        let mut defaults = app.ui.dialogs.first().unwrap().fields.clone();
+        let before = params_of(&defaults)["colors"].clone();
+        egui::Context::default().run_ui(Default::default(), |ui| body(ui, &mut defaults)).textures_delta.clear();
+        assert_eq!(before.as_u64(), Some(256));
+        assert_eq!(params_of(&defaults)["colors"], before, "opening a preview must not schedule a second job just to normalize its count");
+        let mut fields = Map::new();
+        fields.insert("__command".into(), json!("image.mode.indexedColor"));
+        fields.insert("colors".into(), json!(17));
+        fields.insert("amount".into(), json!(37.5));
+        egui::Context::default().run_ui(Default::default(), |ui| body(ui, &mut fields)).textures_delta.clear();
+        let params = params_of(&fields);
+        assert_eq!(params["colors"].as_u64(), Some(17));
+        assert_eq!(params["amount"].as_f64(), Some(37.5));
     }
 
     #[test]
@@ -447,6 +696,8 @@ mod tests {
             "filter.distort.displace",
             "filter.pixelate.mezzotint",
             "filter.render.lightingEffects",
+            "filter.render.relight",
+            "filter.other.colorToAlpha",
         ] {
             assert!(has_dialog(id), "{id}");
         }
@@ -465,6 +716,41 @@ mod tests {
     }
 
     #[test]
+    fn korean_covers_generated_filter_options_and_gallery_names() {
+        let ko = crate::i18n::lang_from_tag("ko-KR").unwrap();
+        let mut missing = std::collections::BTreeSet::new();
+        let mut check = |s: String| {
+            if !matches!(s.as_str(), "X" | "Y" | "A" | "B") && !crate::i18n::has(ko, &s) {
+                missing.insert(s);
+            }
+        };
+        for c in photocraft_engine::command_specs().iter().filter(|c| c.id.starts_with("filter.") || c.id.starts_with("image.adjustments.")) {
+            for p in parse_spec(c.params) {
+                if !p.key.chars().all(|c| c.is_ascii_alphanumeric()) || matches!(p.kind, Kind::Json) {
+                    continue;
+                }
+                check(source_label(&p.key));
+                if let Kind::Choice(choices) = p.kind {
+                    for choice in choices {
+                        // Only symbolic options are UI choices; registry docs also contain
+                        // colour syntax and array notation, which are not translatable names.
+                        if choice.chars().all(|c| c.is_ascii_alphanumeric()) {
+                            check(source_label(&choice));
+                        }
+                    }
+                }
+            }
+        }
+        for f in photocraft_algo::GalleryFilter::ALL {
+            check(f.name().to_string());
+        }
+        for cat in photocraft_algo::GALLERY_CATEGORIES {
+            check(cat.to_string());
+        }
+        assert!(missing.is_empty(), "missing Korean dynamic labels: {missing:#?}");
+    }
+
+    #[test]
     fn preview_runs_engine_command_on_proxy() {
         let mut doc = Document::with_background(
             "p",
@@ -479,5 +765,243 @@ mod tests {
         let p = out.layers[0].surface().unwrap().pixel(32, 32);
         assert!(p[0] > 0.2 && p[0] < 0.8, "edge blurred: {p:?}");
         assert_eq!(label("wavelengthMin"), "Wavelength Min");
+    }
+
+    #[test]
+    fn core_filter_previews_keep_minimum_settings_after_downsampling() {
+        use photocraft_doc::{Color, ColorMode, SampleType, Size};
+        use photocraft_geom::Rect;
+
+        for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+            let mut doc = Document::with_background("preview", Size::new(32, 32), ColorMode::Rgb, depth, Color::WHITE);
+            let layer = doc.layers[0].id;
+            doc.layers[0].surface_mut().unwrap().fill_rect(Rect::new(0, 0, 16, 32), &[0.0, 0.0, 0.0, 1.0]);
+            for (suffix, params) in [
+                ("blur.boxBlur", json!({"radius":1})),
+                ("blur.motionBlur", json!({"distance":1})),
+                ("blur.surfaceBlur", json!({"radius":1})),
+                ("noise.median", json!({"radius":1})),
+                ("noise.dustAndScratches", json!({"radius":1})),
+                ("pixelate.mosaic", json!({"cellSize":2})),
+                ("stylize.emboss", json!({"height":1})),
+                ("other.minimum", json!({"radius":0.2})),
+                ("other.maximum", json!({"radius":0.2})),
+                ("distort.wave", json!({"wavelengthMin":1,"wavelengthMax":2,"amplitudeMin":1,"amplitudeMax":1})),
+            ] {
+                let command = format!("filter.{suffix}");
+                for k in [2, 4] {
+                    let proxy = crate::proxy::proxy_document(&doc, k);
+                    let expected = preview_document(&proxy, Some(layer), &command, &params, 1).unwrap();
+                    let out = preview_document(&doc, Some(layer), &command, &params, k).unwrap_or_else(|| panic!("{command}: {depth:?}, proxy factor {k}"));
+                    assert_eq!(
+                        out.layers[0].surface().unwrap().read_region(proxy.bounds()),
+                        expected.layers[0].surface().unwrap().read_region(proxy.bounds()),
+                        "{command}: {depth:?}, proxy factor {k}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn colour_params_parse_with_and_without_a_default() {
+        let p = parse_spec(r##"{"color":color=#ffffff,"vineColor":color,"bad":color=#zz}"##);
+        assert_eq!(p[0].kind, Kind::Color(Some([1.0, 1.0, 1.0])));
+        assert_eq!(p[1].kind, Kind::Color(None));
+        assert_eq!(p[2].kind, Kind::Color(None));
+    }
+
+    /// Color to Alpha (#1576): the dialog starts at white and the GIMP-style thresholds, drawing it
+    /// keeps those params, and its live preview makes the white of a Background transparent.
+    #[test]
+    fn color_to_alpha_dialog_defaults_draw_and_preview() {
+        const ID: &str = "filter.other.colorToAlpha";
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 32, "height": 32})).unwrap();
+        let id = open(&mut app, ID).unwrap();
+        let mut f = app.ui.dialogs.iter().find(|d| d.id == id).unwrap().fields.clone();
+        assert_eq!(f.get("__preview"), Some(&json!(true)));
+        let want = json!({"color": "#ffffff", "transparencyThreshold": 0.0, "opacityThreshold": 1.0});
+        assert_eq!(params_of(&f), want);
+        egui::Context::default().run_ui(Default::default(), |ui| body(ui, &mut f)).textures_delta.clear();
+        assert_eq!(params_of(&f), want, "drawing the dialog keeps its params");
+
+        let mut doc = Document::with_background(
+            "p",
+            photocraft_doc::Size::new(32, 32),
+            photocraft_doc::ColorMode::Rgb,
+            photocraft_doc::SampleType::U16,
+            photocraft_doc::Color::WHITE,
+        );
+        let bg = doc.layers[0].id;
+        doc.layers[0].surface_mut().unwrap().fill_rect(photocraft_geom::Rect::new(0, 0, 8, 32), &[0.0, 0.0, 0.0, 1.0]);
+        for k in [1, 2] {
+            let out = preview_document(&doc, Some(bg), ID, &want, k).unwrap();
+            let s = out.layers[0].surface().unwrap();
+            assert_eq!(out.layers[0].name, "Layer 0", "k={k}");
+            assert!(s.pixel(24 / k as i32, 4)[3] < 1e-3, "k={k}: white removed");
+            assert_eq!(s.pixel(1, 4)[3], 1.0, "k={k}: black kept");
+        }
+    }
+
+    #[test]
+    fn preview_stays_inside_the_selection_at_every_proxy_factor() {
+        use photocraft_doc::SampleType;
+        for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+            let mut doc =
+                Document::with_background("p", photocraft_doc::Size::new(64, 64), photocraft_doc::ColorMode::Rgb, depth, photocraft_doc::Color::gray(0.5));
+            let bg = doc.layers[0].id;
+            let mut sel = photocraft_raster::Surface::new(photocraft_doc::PixelFormat::GRAY8);
+            sel.fill_rect(photocraft_geom::Rect::new(0, 0, 32, 64), &[1.0]);
+            doc.selection = Some(sel);
+            for k in [1, 2, 4] {
+                let out = preview_document(&doc, Some(bg), "filter.noise.addNoise", &json!({"amount": 100.0}), k).unwrap();
+                let s = out.layers[0].surface().unwrap();
+                let half = 32 / k as i32;
+                let changed = |x0: i32, x1: i32| (0..64 / k as i32).any(|y| (x0..x1).any(|x| s.pixel(x, y) != doc.layers[0].surface().unwrap().pixel(0, 0)));
+                assert!(changed(0, half), "{depth:?} k={k}: noise inside the selection");
+                assert!(!changed(half, 64 / k as i32), "{depth:?} k={k}: nothing outside the selection");
+            }
+        }
+    }
+
+    #[test]
+    fn define_pattern_asks_for_a_name() {
+        // Edit › Define Pattern… named the pattern after the document without asking ("ask", then
+        // "ask 2"). Photoshop's Pattern Name dialog starts from that name and lets you change it.
+        let spec = photocraft_engine::commands::find("edit.definePattern").unwrap();
+        assert_eq!(parse_spec(spec.params), vec![Param { key: "name".into(), kind: Kind::Text }, Param { key: "rect".into(), kind: Kind::Json }]);
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 8, "height": 8, "name": "ask.jpg"})).unwrap();
+        let ctx = egui::Context::default();
+        let define = |app: &mut PhotocraftApp, name: Option<&str>| {
+            crate::menus::invoke(app, &ctx, "edit.definePattern", Value::Null).unwrap();
+            let d = app.ui.dialogs.last().expect("Define Pattern opens a dialog").clone();
+            let shown = d.fields["name"].as_str().unwrap().to_string();
+            if let Some(n) = name {
+                app.ui.dialog_mut(d.id).unwrap().fields.insert("name".into(), json!(n));
+            }
+            crate::dialogs::confirm(app, d.id).unwrap();
+            shown
+        };
+        assert_eq!(define(&mut app, Some("Bricks")), "ask", "prefilled with the document's name");
+        assert_eq!(define(&mut app, None), "ask", "Bricks didn't take it");
+        assert_eq!(define(&mut app, None), "ask 2", "numbered past the library");
+        let names: Vec<&str> = app.session.patterns.items.iter().map(|p| p.name.as_str()).collect();
+        for n in ["Bricks", "ask", "ask 2"] {
+            assert!(names.contains(&n), "{n} in {names:?}");
+        }
+    }
+
+    #[test]
+    fn notes_after_a_spec_are_not_parameters() {
+        // A note after the object, like Selective Color's "(per-range [c,m,y,k] arrays: …)", was
+        // parsed as parameters: its commas split off junk fields and it glued itself onto the last
+        // one, so "reds":json became a number field the dialog showed and sent.
+        let p = parse_spec(r#"{"a":0..10=1,"b":json} (notes [x,y,z] here, and more) → {"c":id}"#);
+        assert_eq!(p, vec![Param { key: "a".into(), kind: Kind::Range { min: 0.0, max: 10.0, default: 1.0 } }, Param { key: "b".into(), kind: Kind::Json }]);
+        // Every command with a schema dialog has plain parameter keys.
+        for c in photocraft_engine::command_specs().iter().filter(|c| has_dialog(c.id)) {
+            for p in parse_spec(c.params) {
+                assert!(p.key.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_'), "{}: junk parameter {:?}", c.id, p.key);
+            }
+        }
+    }
+
+    #[test]
+    fn selective_color_dialog_ok_applies() {
+        // With the junk `reds: 0` the dialog's OK failed (`reds` must be an array of 4 numbers).
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 8, "height": 8})).unwrap();
+        let id = open(&mut app, "image.adjustments.selectiveColor").unwrap();
+        let fields = app.ui.dialogs.last().unwrap().fields.clone();
+        assert!(fields.keys().all(|k| k.starts_with("__") || k.chars().all(|ch| ch.is_ascii_alphanumeric())), "{fields:?}");
+        assert!(!fields.contains_key("reds"), "the per-range arrays are not dialog fields");
+        app.ui.dialog_mut(id).unwrap().fields.insert("black".into(), json!(40.0));
+        crate::dialogs::confirm(&mut app, id).unwrap();
+        assert_eq!(app.session.journal.last().map(|j| j.0.as_str()), Some("image.adjustments.selectiveColor"));
+    }
+
+    /// A filtered test image with structure at every scale (low-frequency waves plus a ramp).
+    fn waves(n: u32) -> Document {
+        let mut doc = Document::with_background(
+            "w",
+            photocraft_doc::Size::new(n, n),
+            photocraft_doc::ColorMode::Rgb,
+            photocraft_doc::SampleType::U8,
+            photocraft_doc::Color::WHITE,
+        );
+        let s = doc.layers[0].surface_mut().unwrap();
+        for y in 0..n as i32 {
+            for x in 0..n as i32 {
+                let v = 0.5 + 0.4 * (x as f32 / 23.0).sin() * (y as f32 / 31.0).cos();
+                s.fill_rect(photocraft_geom::Rect::new(x, y, x + 1, y + 1), &[v, 1.0 - v, x as f32 / n as f32, 1.0]);
+            }
+        }
+        doc
+    }
+
+    /// Mean absolute RGB difference of two documents, compared at 1/4 scale.
+    fn diff_at_quarter(a: &Document, b: &Document) -> f32 {
+        let quarter = |d: &Document| photocraft_compose::flatten(&crate::proxy::proxy_document(d, (d.size.width / 64).max(1)));
+        let (a, b) = (quarter(a), quarter(b));
+        assert_eq!(a.px.len(), b.px.len());
+        a.px.iter().zip(&b.px).map(|(p, q)| (0..3).map(|c| (p[c] - q[c]).abs()).sum::<f32>() / 3.0).sum::<f32>() / a.px.len() as f32
+    }
+
+    /// #2063: Ripple, Diffuse, Oil Paint, Flame, Fibers and Mezzotint drew their features in
+    /// proxy pixels, so a 1/4 preview showed them 4x larger than OK applied them. Their preview
+    /// now runs at full resolution and matches the applied result.
+    #[test]
+    fn fixed_size_filters_preview_at_the_scale_they_apply() {
+        let doc = waves(256);
+        let bg = doc.layers[0].id;
+        for (cmd, p) in [
+            ("filter.distort.ripple", json!({"amount": 300.0, "size": "large"})),
+            ("filter.stylize.diffuse", json!({"mode": "normal"})),
+            ("filter.stylize.oilPaint", json!({})),
+            ("filter.render.flame", json!({})),
+            ("filter.render.fibers", json!({})),
+            ("filter.pixelate.mezzotint", json!({"type": "mediumDots"})),
+        ] {
+            let applied = preview_document(&doc, Some(bg), cmd, &p, 1).unwrap();
+            let old = preview_document(&doc, Some(bg), cmd, &p, 4).unwrap();
+            assert!(diff_at_quarter(&applied, &old) > 0.005, "{cmd}: a 1/4 proxy differs from the result");
+            let k = preview_factor(cmd, &p, 4);
+            assert_eq!(k, 1, "{cmd}");
+            let shown = preview_document(&doc, Some(bg), cmd, &p, k).unwrap();
+            assert!(diff_at_quarter(&applied, &shown) < 1e-4, "{cmd}: the preview is what OK applies");
+        }
+    }
+
+    /// #2063: a pixel-sized parameter divided by the proxy factor was clamped to the command's
+    /// minimum (Pointillize's 5 px cells became 3 px proxy cells = 12 px), so the preview factor
+    /// drops until every pixel-sized value fits its range.
+    #[test]
+    fn proxy_previews_never_clamp_pixel_sized_params() {
+        let pointillize = |c: f64| preview_factor("filter.pixelate.pointillize", &json!({"cellSize": c}), 4);
+        assert_eq!((pointillize(5.0), pointillize(7.0), pointillize(12.0), pointillize(300.0)), (1, 2, 4, 4));
+        assert_eq!(preview_factor("filter.pixelate.crystallize", &json!({"cellSize": 10.0}), 4), 3);
+        assert_eq!(preview_factor("filter.pixelate.colorHalftone", &json!({"maxRadius": 8.0}), 4), 2);
+        assert_eq!(preview_factor("filter.blur.gaussianBlur", &json!({"radius": 8.0}), 4), 4, "unclamped filters keep the proxy");
+        // Hostile params never panic and leave the factor alone; a full-size document stays at 1.
+        assert_eq!(preview_factor("filter.pixelate.pointillize", &json!({"cellSize": "x"}), 4), 4);
+        assert_eq!(preview_factor("filter.pixelate.pointillize", &json!(null), 4), 4);
+        assert_eq!(preview_factor("no.such.command", &json!({"cellSize": 1.0}), 4), 4);
+        assert_eq!(preview_factor("filter.pixelate.pointillize", &json!({"cellSize": 5.0}), 0), 1);
+        // Every previewed command, at each pixel-sized param's minimum, default and in between.
+        let previewed = photocraft_engine::command_specs().iter().filter(|c| has_dialog(c.id) && (c.id.starts_with("filter.") || PREVIEWED.contains(&c.id)));
+        for c in previewed {
+            for p in parse_spec(c.params) {
+                let Kind::Range { min, default, .. } = p.kind else { continue };
+                if min <= 0.0 || !is_pixel_param(&p.key) {
+                    continue;
+                }
+                for v in [f64::from(min), f64::from(default), f64::from(min) * 2.5] {
+                    let k = preview_factor(c.id, &json!({ p.key.clone(): v }), 4);
+                    assert!(v / f64::from(k) >= f64::from(min) - 1e-9, "{} {}={v}: k={k} clamps to {min}", c.id, p.key);
+                }
+            }
+        }
     }
 }

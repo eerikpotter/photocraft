@@ -659,7 +659,7 @@ fn html_table(title: &str, w: u32, h: u32, cells: &[(Rect, String, String)], spa
     for (r, attrs, body) in cells {
         let (c0, c1, r0, r1) = (col(r.x0), col(r.x1), row(r.y0), row(r.y1));
         if (r0..r1).any(|j| (c0..c1).any(|i| taken[j * nc + i])) {
-            continue; // overlapped by an earlier slice
+            continue; // overlapped (the caller cuts slices into visible pieces, so this can't happen)
         }
         for j in r0..r1 {
             for i in c0..c1 {
@@ -707,7 +707,20 @@ fn html_table(title: &str, w: u32, h: u32, cells: &[(Rect, String, String)], spa
 
 /// File › Export › Save for Web (Legacy).
 fn save_for_web(s: &mut Session, p: &Value) -> Result<Value> {
+    save_for_web_with_writer(s, p, &mut write_file)
+}
+
+/// Save for Web through a platform writer (native files or browser downloads).
+/// The writer receives every image, spacer and HTML file. A write error stops the export;
+/// only a complete export remembers its settings and fires the export event.
+pub fn save_for_web_with_writer(s: &mut Session, p: &Value, write: &mut dyn FnMut(&str, &[u8]) -> Result<()>) -> Result<Value> {
     let cmd = "file.export.saveForWebLegacy";
+    if let Some(authorize) = s.authorize {
+        authorize(cmd, p)?;
+    }
+    // Direct platform calls must export the moved selection as it appears on the canvas,
+    // just as Session::execute does before dispatching the native command.
+    crate::float_cmds::before_command(s, cmd)?;
     let st = WebSettings::from_params(p, cmd)?;
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let doc = d.doc.clone();
@@ -730,7 +743,6 @@ fn save_for_web(s: &mut Session, p: &Value) -> Result<Value> {
         .collect();
     let single = p.get("path").and_then(Value::as_str).filter(|v| !v.is_empty());
     let dir = p.get("dir").and_then(Value::as_str).filter(|v| !v.is_empty());
-    s.file_menu.last_web = Some(p.clone());
     // Estimate only (the dialog's annotations): the whole image, or each chosen slice.
     if single.is_none() && dir.is_none() {
         let o = optimize(&buf.px, bw, wdoc.bounds(), &st, icc, xmp.as_deref(), dpi, false)?;
@@ -738,7 +750,8 @@ fn save_for_web(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(path) = single.filter(|_| dir.is_none() && (all.len() == 1 || p.get("slices").is_none())) {
         let o = optimize(&buf.px, bw, wdoc.bounds(), &st, icc, xmp.as_deref(), dpi, false)?;
-        write_file(path, &o.bytes)?;
+        write(path, &o.bytes)?;
+        s.file_menu.last_web = Some(p.clone());
         crate::automate_cmds::fire_event(s, "export");
         return Ok(json!({"files": [path], "bytes": o.bytes.len(), "width": o.width, "height": o.height, "colors": o.colors}));
     }
@@ -750,35 +763,69 @@ fn save_for_web(s: &mut Session, p: &Value) -> Result<Value> {
     let mut files = Vec::new();
     let mut cells: Vec<(Rect, String, String)> = Vec::new();
     let mut total = 0usize;
+    // Output names are unique (case-insensitively, for macOS and Windows file systems): two
+    // slices named alike, or names that sanitize alike, must not overwrite each other. The HTML
+    // page's spacer image is reserved.
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if html {
+        used.insert("spacer.gif".into());
+    }
+    let mut unique = |stem: &str, ext: &str| {
+        let mut name = format!("{stem}.{ext}");
+        let mut k = 2u32;
+        while !used.insert(name.to_lowercase()) {
+            name = format!("{stem}_{k}.{ext}");
+            k = k.saturating_add(1);
+        }
+        name
+    };
+    // Stacking order: later stored slices are on top (auto slices never overlap anything).
+    let z = |r: &ResolvedSlice| r.id.and_then(|id| doc.slices.list.iter().position(|sl| sl.id == id));
     for r in &chosen {
         let rect = scale_rect(r.rect, sx, sy).intersect(&wdoc.bounds());
         if rect.is_empty() {
             continue;
         }
-        let stored = r.id.and_then(|id| doc.slices.get(id));
-        if r.kind == SliceKind::NoImage {
-            let text = stored.map(|s| if s.cell_text_is_html { s.cell_text.clone() } else { html_escape(&s.cell_text) }).unwrap_or_default();
-            let bg = stored.and_then(|s| s.background).map(|c| format!(" bgcolor=\"#{:02X}{:02X}{:02X}\"", c[1], c[2], c[3])).unwrap_or_default();
-            cells.push((rect, bg, text));
-            continue;
-        }
-        let o = optimize(&buf.px, bw, rect, &st, icc, xmp.as_deref(), dpi, false)?;
-        let name = format!("{}.{}", slice_file(&r.name), o.ext);
-        let rel = if images.is_empty() { name.clone() } else { format!("{images}/{name}") };
-        let out = join(&dir, &rel);
-        write_file(&out, &o.bytes)?;
-        total += o.bytes.len();
-        files.push(out);
-        let alt = stored.map_or(String::new(), |s| html_escape(&s.alt));
-        let img = format!("\n\t\t\t<img src=\"{}\" width=\"{}\" height=\"{}\" alt=\"{alt}\">", html_escape(&rel), rect.width(), rect.height());
-        let body = match stored.filter(|s| !s.url.is_empty()) {
-            Some(s) => {
-                let target = if s.target.is_empty() { String::new() } else { format!(" target=\"{}\"", html_escape(&s.target)) };
-                format!("\n\t\t\t<a href=\"{}\"{target}>{img}</a>", html_escape(&s.url))
-            }
-            None => img,
+        // In the HTML table a slice shows only where no slice above covers it; that visible part
+        // is cut into rectangles, each its own cell (and image), as Photoshop's subslices.
+        let pieces = if html {
+            let above: Vec<Rect> = chosen.iter().filter(|o| z(o) > z(r)).map(|o| scale_rect(o.rect, sx, sy).intersect(&wdoc.bounds())).collect();
+            slices::auto_slices(rect, &above)
+        } else {
+            vec![rect]
         };
-        cells.push((rect, String::new(), body));
+        let split = pieces.len() > 1;
+        let stored = r.id.and_then(|id| doc.slices.get(id));
+        for (k, piece) in pieces.into_iter().enumerate() {
+            if r.kind == SliceKind::NoImage {
+                let text = if k > 0 {
+                    String::new()
+                } else {
+                    stored.map(|s| if s.cell_text_is_html { s.cell_text.clone() } else { html_escape(&s.cell_text) }).unwrap_or_default()
+                };
+                let bg = stored.and_then(|s| s.background).map(|c| format!(" bgcolor=\"#{:02X}{:02X}{:02X}\"", c[1], c[2], c[3])).unwrap_or_default();
+                cells.push((piece, bg, text));
+                continue;
+            }
+            let o = optimize(&buf.px, bw, piece, &st, icc, xmp.as_deref(), dpi, false)?;
+            let stem = if split { format!("{}_{:02}", slice_file(&r.name), k + 1) } else { slice_file(&r.name) };
+            let name = unique(&stem, o.ext);
+            let rel = if images.is_empty() { name.clone() } else { format!("{images}/{name}") };
+            let out = join(&dir, &rel);
+            write(&out, &o.bytes)?;
+            total += o.bytes.len();
+            files.push(out);
+            let alt = stored.map_or(String::new(), |s| html_escape(&s.alt));
+            let img = format!("\n\t\t\t<img src=\"{}\" width=\"{}\" height=\"{}\" alt=\"{alt}\">", html_escape(&rel), piece.width(), piece.height());
+            let body = match stored.filter(|s| !s.url.is_empty()) {
+                Some(s) => {
+                    let target = if s.target.is_empty() { String::new() } else { format!(" target=\"{}\"", html_escape(&s.target)) };
+                    format!("\n\t\t\t<a href=\"{}\"{target}>{img}</a>", html_escape(&s.url))
+                }
+                None => img,
+            };
+            cells.push((piece, String::new(), body));
+        }
     }
     let mut html_path = None;
     if html {
@@ -786,13 +833,14 @@ fn save_for_web(s: &mut Session, p: &Value) -> Result<Value> {
         let spacer = grid.then(|| if images.is_empty() { "spacer.gif".to_string() } else { format!("{images}/spacer.gif") });
         if let Some(sp) = &spacer {
             let gif = photocraft_codecs::web::encode_gif_indexed(1, 1, &[0], &[[0, 0, 0]], Some(0), false).map_err(other)?;
-            write_file(&join(&dir, sp), &gif)?;
+            write(&join(&dir, sp), &gif)?;
         }
         let page = html_table(&base, wdoc.size.width, wdoc.size.height, &cells, spacer.as_deref());
         let hp = join(&dir, &format!("{base}.html"));
-        write_file(&hp, page.as_bytes())?;
+        write(&hp, page.as_bytes())?;
         html_path = Some(hp);
     }
+    s.file_menu.last_web = Some(p.clone());
     crate::automate_cmds::fire_event(s, "export");
     Ok(json!({"files": files, "html": html_path, "bytes": total, "slices": chosen.len(), "width": wdoc.size.width, "height": wdoc.size.height}))
 }
@@ -806,6 +854,8 @@ fn export_preferences(s: &mut Session, p: &Value) -> Result<Value> {
         ("quickExportFormat", "export.quickExportFormat"),
         ("quickExportLocation", "export.quickExportLocation"),
         ("jpegQuality", "export.jpegQuality"),
+        ("webpLossless", "export.webpLossless"),
+        ("webpQuality", "export.webpQuality"),
         ("metadata", "export.metadata"),
         ("convertToSrgb", "export.convertToSrgb"),
     ] {
@@ -863,9 +913,12 @@ fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
             o.insert("format".into(), json!("gif"));
         }
         "webp" => {
-            // WebP has no legacy Save for Web optimiser: write it through the regular exporter.
+            // WebP uses the regular exporter. Its optional quality is in the Photoshop-style
+            // 0–12 save scale: invert that mapping so the codec receives the chosen 1–100.
+            // Keeping quality absent preserves the historical lossless Quick Export behavior.
             let (wdoc, _, _) = web_document(&doc, &json!({}), &WebSettings { convert_to_srgb: prefs.convert_to_srgb, ..Default::default() })?;
-            let warnings = crate::file_cmds::save_doc(&wdoc, &path, None)?;
+            let quality = if prefs.webp_lossless { None } else { Some((f64::from(prefs.webp_quality.clamp(1, 100)) - 1.0) * 12.0 / 99.0) };
+            let warnings = crate::file_cmds::save_doc(&wdoc, &path, quality)?;
             crate::automate_cmds::fire_event(s, "export");
             return Ok(json!({"path": path, "format": fmt, "warnings": warnings}));
         }
@@ -1177,7 +1230,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export Preferences…",
             &["File", "Export"],
             None,
-            r##"{"quickExportFormat":"png|jpg|gif|webp"?,"quickExportLocation":"ask|sameFolder"?,"jpegQuality":1..100?,"metadata":"none|copyright|all"?,"convertToSrgb":bool?} → {values}"##,
+            r##"{"quickExportFormat":"png|jpg|gif|webp"?,"quickExportLocation":"ask|sameFolder"?,"jpegQuality":1..100?,"webpLossless":bool?,"webpQuality":1..100?,"metadata":"none|copyright|all"?,"convertToSrgb":bool?} → {values}"##,
             |_| Ok(()),
             export_preferences
         ),

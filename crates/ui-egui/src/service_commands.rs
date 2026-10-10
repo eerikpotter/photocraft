@@ -70,6 +70,60 @@ pub(crate) fn insert_menu_items(app: &PhotocraftApp, items: &mut Vec<MenuItem>) 
     }
 }
 
+// Only presentation data is shared with the menu renderer. This avoids changing
+// upstream's recursive menu functions whenever a host adds a section.
+type Sections = std::collections::BTreeMap<&'static str, Section>;
+fn sections_id() -> egui::Id {
+    egui::Id::new("host-menu-sections")
+}
+
+pub(crate) fn prepare_sections(app: &PhotocraftApp, ctx: &egui::Context) {
+    let sections: Sections = app
+        .services
+        .commands
+        .iter()
+        .filter(|command| command.id.starts_with("host."))
+        .filter_map(|command| command.section.clone().map(|section| (command.id, section)))
+        .collect();
+    ctx.data_mut(|data| data.insert_temp(sections_id(), sections));
+}
+
+#[derive(Default)]
+pub(crate) struct SectionRenderer {
+    previous: Option<&'static str>,
+    sections: Sections,
+}
+impl SectionRenderer {
+    pub(crate) fn new(ctx: &egui::Context) -> Self {
+        Self { previous: None, sections: ctx.data(|data| data.get_temp::<Sections>(sections_id())).unwrap_or_default() }
+    }
+    pub(crate) fn before_row(&mut self, ui: &mut egui::Ui, item: &MenuItem, depth: usize, last_was_sep: &mut bool) {
+        let section = self.sections.get(item.id.as_str()).filter(|_| item.path.len() == depth && item.label != "---");
+        if section.map(|section| section.id) == self.previous {
+            return;
+        }
+        if (self.previous.is_some() || section.is_some()) && !*last_was_sep && item.label != "---" {
+            ui.separator();
+            *last_was_sep = true;
+        }
+        if let Some(section) = section {
+            ui.push_id(section.id, |ui| {
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(ui.spacing().button_padding.x);
+                    if let Some(icon) = &section.icon {
+                        ui.add(egui::Image::new(icon.clone()).fit_to_exact_size(egui::vec2(18.0, 12.0)));
+                    }
+                    let tokens = crate::theme::Tokens::get(ui.ctx());
+                    ui.label(egui::RichText::new(section.title).small().strong().color(tokens.text_dim));
+                });
+                ui.add_space(3.0);
+            });
+        }
+        self.previous = section.map(|section| section.id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

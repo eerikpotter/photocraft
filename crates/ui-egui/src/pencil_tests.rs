@@ -13,8 +13,12 @@ fn app() -> PhotocraftApp {
     let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
     app.run("file.new", json!({"width": 120, "height": 80, "background": "transparent"})).unwrap();
     app.run("tools.setColors", json!({"foreground": "#000000", "background": "#ffffff"})).unwrap();
-    app.run("tools.setBrush", json!({"brush": {"size": 3, "hardness": 0.0, "smoothing": {"amount": 0.0}}})).unwrap();
+    app.run("tools.setBrush", json!({"brush": {"size": 3, "hardness": 0.0}})).unwrap();
+    // Each tool keeps its own brush (#218): switch first, then set the Pencil's options, as the
+    // options bar does (its first frame takes the Brush's tip at Photoshop's 10 % smoothing).
     app.ui.tool = Tool::Pencil;
+    crate::paint_mouse::sync_tool_brush(&mut app);
+    app.run("tools.setBrush", json!({"brush": {"smoothing": {"amount": 0.0}}})).unwrap();
     app
 }
 
@@ -110,7 +114,7 @@ fn ctrl_alt_drag_resizes_the_pencil_without_painting() {
 #[test]
 fn square_cursor_sits_on_the_pixel_grid() {
     let rect = Rect::from_min_size(Pos2::new(0.0, 0.0), vec2(800.0, 600.0));
-    let xf = ViewXform { rect, zoom: 8.0, center: [50.0, 37.5], flip: false };
+    let xf = ViewXform { rect, zoom: 8.0, center: [50.0, 37.5], flip: false, rotation: 0.0 };
     // 1 px at 800 %: the 8-point square of the pixel under the pointer.
     let r = pencil_cursor_rect(&xf, [10.3, 5.7], 1.0, 1.0);
     assert_eq!(r, Rect::from_two_pos(xf.to_screen(10.0, 5.0), xf.to_screen(11.0, 6.0)));
@@ -122,7 +126,7 @@ fn square_cursor_sits_on_the_pixel_grid() {
     assert_eq!(r, Rect::from_two_pos(xf.to_screen(9.0, 4.0), xf.to_screen(12.0, 7.0)));
     // At 2× and at an odd zoom the edges land on physical pixels.
     for (zoom, ppp) in [(3.3, 2.0), (0.5, 2.0), (1.0, 1.0), (13.7, 1.5)] {
-        let xf = ViewXform { rect: Rect::from_min_size(Pos2::new(0.3, 0.7), vec2(800.0, 600.0)), zoom, center: [50.2, 37.9], flip: true };
+        let xf = ViewXform { rect: Rect::from_min_size(Pos2::new(0.3, 0.7), vec2(800.0, 600.0)), zoom, center: [50.2, 37.9], flip: true, rotation: 0.0 };
         let r = pencil_cursor_rect(&xf, [20.4, 30.6], 5.0, ppp);
         for v in [r.min.x, r.min.y, r.max.x, r.max.y] {
             assert!((v * ppp - (v * ppp).round()).abs() < 1e-3, "zoom {zoom} ppp {ppp}: {v}");
@@ -134,7 +138,7 @@ fn square_cursor_sits_on_the_pixel_grid() {
 }
 
 #[test]
-fn b_cycles_brush_and_pencil() {
+fn b_cycles_brush_pencil_and_mixer_brush() {
     let mut h = Harness::builder().with_size(vec2(1280.0, 800.0)).with_max_steps(64).build_eframe(|cc| {
         PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
@@ -152,13 +156,18 @@ fn b_cycles_brush_and_pencil() {
     assert_eq!(h.state().ui.tool, Tool::Brush);
     press(&mut h, Modifiers::NONE);
     assert_eq!(h.state().ui.tool, Tool::Pencil);
+    press(&mut h, Modifiers::NONE);
+    assert_eq!(h.state().ui.tool, Tool::MixerBrush);
     // Use Shift Key for Tool Switch: ⇧B cycles, B keeps the group's tool.
     h.state_mut().session.edit_prefs(|p| p.tools.use_shift_key_for_tool_switch = true);
     press(&mut h, Modifiers::SHIFT);
     assert_eq!(h.state().ui.tool, Tool::Brush);
     press(&mut h, Modifiers::SHIFT);
     assert_eq!(h.state().ui.tool, Tool::Pencil);
+    press(&mut h, Modifiers::SHIFT);
+    assert_eq!(h.state().ui.tool, Tool::MixerBrush);
     press(&mut h, Modifiers::NONE);
-    assert_eq!(h.state().ui.tool, Tool::Pencil);
+    assert_eq!(h.state().ui.tool, Tool::MixerBrush);
     assert_eq!(Tool::from_name("pencil"), Some(Tool::Pencil));
+    assert_eq!(Tool::from_name("mixerBrush"), Some(Tool::MixerBrush));
 }
