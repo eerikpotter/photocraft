@@ -14,6 +14,7 @@ impl Cloud {
         self.projects.clear();
         self.account = None;
         self.pending_save = None;
+        self.pending_open = None;
         self.attempt = None;
         self.delete = None;
         // Retain document bindings so a different account cannot silently save them as its own.
@@ -50,14 +51,15 @@ impl Cloud {
             self.notify("This file is not available to the signed-in account.", true);
             return;
         }
+        let kind = self.spec.kind();
         self.begin_operation("Opening your cloud file…");
         let stamp = self.auth.borrow().as_ref().map(|s| s.stamp().to_string()).unwrap_or_default();
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         wasm_bindgen_futures::spawn_local(async move {
             let result: CloudResult<_> = async {
                 let details = api.file(link.space, link.file).await?;
-                if details.kind != FileKind::photocraft() {
-                    return Err("This file format is not supported by PhotoCraft".into());
+                if details.kind != kind? {
+                    return Err("This file format is not supported by this editor".into());
                 }
                 let latest = details.project.revisions.last().ok_or("File has no saved version")?;
                 let (revision, bytes) = api.download(link.file, latest.id, |_| {}).await?;

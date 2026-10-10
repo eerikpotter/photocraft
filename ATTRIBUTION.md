@@ -63,3 +63,9 @@ next to the files:
 | `corpus/pngsuite/` | PngSuite | Willem van Schaik | <http://www.schaik.com/pngsuite/> | Public domain |
 
 Files copied into `corpus/` by hand (tiff, exr, raw) must be MIT, BSD or CC0.
+
+### Shared Sovereign Cloud
+
+| Asset | Author | Source | License |
+|---|---|---|---|
+| `vendor/sovereign-cloud-ui/assets/icp/logo.svg` | DFINITY Foundation | [DFINITY documentation favicon](https://github.com/dfinity/developer-docs/blob/2e48927666fb50d15a5c874aca4b64f50e584708/public/favicon.svg), viewBox cropped to the infinity mark | Apache-2.0; license and provenance included beside the asset |

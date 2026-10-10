@@ -141,12 +141,14 @@ impl eframe::App for WebShell {
             });
         }
         self.app.logic(ctx, frame);
+        publish_dirty_state(self.app.session.documents().iter().any(|doc| doc.is_dirty()));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.app.ui(ui, frame);
         #[cfg(feature = "icp-cloud")]
         self.cloud.ui(ui.ctx(), &mut self.app);
+        publish_dirty_state(self.app.session.documents().iter().any(|doc| doc.is_dirty()));
     }
 }
 
@@ -234,5 +236,15 @@ fn mime_for(name: &str) -> &'static str {
         Some("gif") => "image/gif",
         Some("psd" | "psb") => "image/vnd.adobe.photoshop",
         _ => "application/octet-stream",
+    }
+}
+
+/// Browser-host contract: report unsaved work without exposing document contents.
+fn publish_dirty_state(dirty: bool) {
+    if let Some(root) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.document_element()) {
+        let value = if dirty { "true" } else { "false" };
+        if root.get_attribute("data-craft-dirty").as_deref() != Some(value) {
+            let _ = root.set_attribute("data-craft-dirty", value);
+        }
     }
 }

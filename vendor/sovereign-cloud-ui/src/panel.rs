@@ -3,15 +3,15 @@ use super::*;
 use presentation::{RevisionAction, SaveAction};
 
 impl Cloud {
-    pub fn ui(&mut self, ctx: &egui::Context, app: &mut PhotocraftApp) {
+    pub fn ui(&mut self, ctx: &egui::Context, app: &mut impl Editor) {
         self.check_session(ctx);
         self.poll(app, ctx);
         self.prepare_save(ctx);
-        let doc_id = app.session.active().map(|d| d.doc.id.0);
+        let doc_id = app.document().map(|d| d.id);
         if self.named_doc != doc_id {
             self.named_doc = doc_id;
             self.copy_mode = false;
-            self.name = app.session.active().map_or_else(|| "Untitled".into(), |d| d.doc.name.clone());
+            self.name = app.document().map_or_else(|| "Untitled".into(), |d| d.name);
         }
         if self.notice.as_ref().and_then(|n| n.expires).is_some_and(|until| js_sys::Date::now() >= until) {
             self.notice = None;
@@ -24,9 +24,9 @@ impl Cloud {
             View::Projects => "Open from Cloud",
         };
         egui::Window::new(title)
-            .id(egui::Id::new("photocraft.cloud.library.window")).open(&mut visible)
+            .id(egui::Id::new("sovereign.cloud.library.window")).open(&mut visible)
             .frame(egui::Frame::window(&ctx.global_style()).fill(t.dock).stroke(egui::Stroke::new(1.0, t.accent_border)).corner_radius(t.radius_lg).inner_margin(16.0))
-            .default_size([760.0, 560.0]).min_width(420.0).default_pos([400.0, 80.0]).vscroll(true)
+            .default_size([760.0, 560.0]).min_width(300.0).vscroll(true)
             .show(ctx, |ui| {
                 presentation::style(ui);
                 presentation::header(ui);
@@ -58,7 +58,7 @@ impl Cloud {
                     presentation::section(ui).show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.heading("A home for your files");
-                        ui.label("Save your PhotoCraft files, keep earlier versions, and open them on another device.");
+                        ui.label("Save your files, keep earlier versions, and open them on another device.");
                         ui.add_space(12.0);
                         let label = if self.signing_in { "Reopen Internet Identity" } else { "Sign in with Internet Identity" };
                         if ui.add_enabled_ui((!self.busy || self.signing_in) && self.auth.borrow().is_some(), |ui| presentation::primary(ui, label)).inner.clicked() {
@@ -82,14 +82,28 @@ impl Cloud {
                     ui.label("File → Sovereign Cloud → Save saves here. File → Save / Export downloads a local copy. Save before closing or reloading; cloud saving is manual.");
                     ui.label("Demo limits: 64 MiB per file; 256 MiB per account including versions; 20 files, 20 versions each; 2 GiB across the service.");
                     ui.label("Files are access-controlled, not end-to-end encrypted. The service controller can upgrade the backend.");
-                    ui.hyperlink_to("Source and architecture", "https://github.com/eerikpotter/photocraft/blob/codex/icp-local-hosting/docs/ICP_CLOUD_ARCHITECTURE.md");
+                    ui.hyperlink_to("Source and architecture", "https://github.com/eerikpotter/subnet-cloud");
                 });
             });
         self.visible = visible;
-        for command in &mut app.services.commands {
-            if matches!(command.id, "host.cloud.save" | "host.cloud.save_copy") {
-                command.enabled = !self.busy && self.attempt.is_none();
-            }
+        let save_enabled = !self.busy && self.attempt.is_none() && self.pending_open.is_none();
+        self.menu.set_enabled(save_enabled);
+        app.set_save_enabled(save_enabled);
+        if self.pending_open.is_some() {
+            egui::Window::new("Open cloud file?").collapsible(false).show(ctx, |ui| {
+                presentation::style(ui);
+                ui.label("The current document has unsaved changes. Opening this file replaces them.");
+                ui.horizontal(|ui| {
+                    if ui.button("Discard changes and open").clicked()
+                        && let Some((project, revision, bytes)) = self.pending_open.take()
+                    {
+                        self.finish_open(app, project, revision, bytes);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.pending_open = None;
+                    }
+                });
+            });
         }
         if let Some((id, method)) = self.delete.clone() {
             egui::Window::new("Delete cloud data?").collapsible(false).show(ctx, |ui| {
@@ -123,8 +137,8 @@ impl Cloud {
         });
     }
 
-    fn save_view(&mut self, ui: &mut egui::Ui, app: &PhotocraftApp, ctx: &egui::Context) {
-        if app.session.active().is_some() {
+    fn save_view(&mut self, ui: &mut egui::Ui, app: &impl Editor, ctx: &egui::Context) {
+        if app.document().is_some() {
             match presentation::save_form(ui, &mut self.name, self.copy_mode, self.attempt.is_none()) {
                 Some(SaveAction::Save) => self.save(app, ctx, self.copy_mode),
                 Some(SaveAction::Cancel) => {
@@ -135,7 +149,7 @@ impl Cloud {
             }
         } else {
             ui.heading("No document is open");
-            ui.label("Create or open a document in PhotoCraft, then choose File → Sovereign Cloud → Save.");
+            ui.label("Create or open a document in the editor, then choose File → Sovereign Cloud → Save.");
         }
     }
 
@@ -144,7 +158,7 @@ impl Cloud {
             ui.add_space(12.0);
             ui.separator();
             ui.strong("Your save is ready to retry");
-            ui.label(presentation::file_name(&a.name));
+            ui.label(self.spec.file_name(&a.name));
             if !self.busy {
                 ui.weak("Retry the captured file, or dismiss this attempt to save your current edits.");
                 ui.horizontal(|ui| {
@@ -185,7 +199,7 @@ impl Cloud {
             let Some(latest) = p.revisions.last() else {
                 continue;
             };
-            let open = presentation::file_row(ui, p.id, &p.name, &timestamp(latest.created_at), |ui| {
+            let open = presentation::file_row(ui, p.id, &self.spec.file_name(&p.name), &timestamp(latest.created_at), |ui| {
                 ui.strong(format!("Version history ({})", p.revisions.len()));
                 for r in p.revisions.iter().rev() {
                     ui.push_id(r.id, |ui| match presentation::revision_row(ui, &timestamp(r.created_at), r.bytes, r.id == latest.id) {
@@ -207,7 +221,7 @@ impl Cloud {
                 ui.weak("These saves did not finish. They cannot be opened. Retry below while the attempt is available, or discard them here.");
                 for p in unfinished {
                     ui.push_id(("unfinished", p.id), |ui| {
-                        ui.strong(presentation::file_name(&p.name));
+                        ui.strong(self.spec.file_name(&p.name));
                         ui.weak(if p.revisions.is_empty() { "No saved version yet" } else { "Your earlier saved versions are available above" });
                         if ui.button("Discard unfinished save…").clicked() {
                             self.delete =

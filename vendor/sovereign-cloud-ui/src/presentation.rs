@@ -1,8 +1,55 @@
 //! Platform-independent cloud controls, shared by the browser and native UI tests.
-use photocraft_ui_egui::theme::{ThemeKind, Tokens};
+use egui::Color32;
 
-pub fn palette(ctx: &egui::Context) -> Tokens {
-    Tokens::for_kind(if Tokens::get(ctx).dark() { ThemeKind::Studio } else { ThemeKind::StudioLight })
+pub struct Palette {
+    pub dock: Color32,
+    pub card: Color32,
+    pub card_border: Color32,
+    pub field: Color32,
+    pub field_border: Color32,
+    pub hover: Color32,
+    pub pressed: Color32,
+    pub text: Color32,
+    pub text_dim: Color32,
+    pub accent: Color32,
+    pub accent_soft: Color32,
+    pub accent_border: Color32,
+    pub accent_text: Color32,
+    pub warning: Color32,
+    pub radius_sm: f32,
+    pub radius_lg: f32,
+    dark: bool,
+}
+impl Palette {
+    pub fn dark(&self) -> bool {
+        self.dark
+    }
+}
+pub fn palette(ctx: &egui::Context) -> Palette {
+    let dark = ctx.global_style().visuals.dark_mode;
+    let rgb = |a: [u8; 3], b: [u8; 3]| {
+        let c = if dark { a } else { b };
+        Color32::from_rgb(c[0], c[1], c[2])
+    };
+    Palette {
+        dock: rgb([17, 17, 18], [240, 240, 243]),
+        card: rgb([26, 26, 28], [252, 252, 253]),
+        card_border: rgb([40, 40, 44], [222, 222, 228]),
+        field: rgb([35, 35, 38], [242, 242, 245]),
+        field_border: rgb([52, 52, 57], [214, 214, 220]),
+        hover: rgb([44, 44, 48], [232, 232, 237]),
+        pressed: rgb([56, 56, 62], [220, 220, 226]),
+        text: rgb([236, 236, 240], [24, 24, 28]),
+        text_dim: rgb([150, 150, 158], [96, 96, 106]),
+        accent: rgb([139, 124, 246], [108, 92, 231]),
+        accent_soft: rgb([46, 41, 67], [231, 228, 250]),
+        accent_border: rgb([96, 86, 144], [174, 163, 239]),
+        accent_text: rgb([214, 208, 255], [80, 64, 200]),
+        warning: rgb([240, 190, 90], [190, 130, 20]),
+        radius_sm: 6.0,
+        radius_lg: 12.0,
+        dark,
+    }
 }
 
 /// Scope the cloud's visual identity to this UI. The editor's theme is untouched.
@@ -37,14 +84,12 @@ pub fn section(ui: &egui::Ui) -> egui::Frame {
 }
 
 pub fn primary(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    // Blue for the action, violet for selected surfaces, both from the existing design tokens.
-    let blue = Tokens::for_kind(ThemeKind::Pro);
-    ui.add(egui::Button::new(egui::RichText::new(label).color(blue.primary_text)).fill(blue.accent).min_size(egui::vec2(128.0, 34.0)))
+    ui.add(egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).fill(Color32::from_rgb(46, 110, 232)).min_size(egui::vec2(128.0, 34.0)))
 }
 
 pub fn header(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        ui.add(egui::Image::new(egui::include_image!("../../assets/icp/logo.svg")).fit_to_exact_size(egui::vec2(24.0, 14.0)));
+        ui.add(egui::Image::new(egui::include_image!("../assets/icp/logo.svg")).fit_to_exact_size(egui::vec2(24.0, 14.0)));
         ui.weak("Sovereign Cloud");
     });
 }
@@ -55,10 +100,6 @@ pub enum SaveAction {
     Cancel,
 }
 
-pub fn file_name(name: &str) -> String {
-    let name = name.trim();
-    if name.to_ascii_lowercase().ends_with(".pcraft") { name.into() } else { format!("{name}.pcraft") }
-}
 pub fn size_label(bytes: u64) -> String {
     if bytes >= 1024 * 1024 { format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0)) } else { format!("{} KiB", bytes.div_ceil(1024)) }
 }
@@ -180,7 +221,6 @@ fn file_cell(ui: &mut egui::Ui, rect: egui::Rect, text: egui::RichText) {
 pub fn file_row(ui: &mut egui::Ui, id: u64, name: &str, timestamp: &str, add_details: impl FnOnce(&mut egui::Ui)) -> bool {
     ui.push_id(("cloud.file", id), |ui| {
         let t = palette(ui.ctx());
-        let name = file_name(name);
         let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id("details"), false);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), FILE_ROW_HEIGHT), egui::Sense::hover());
         let (name_rect, date_rect, open_rect) = file_columns(rect);
@@ -209,7 +249,7 @@ pub fn file_row(ui: &mut egui::Ui, id: u64, name: &str, timestamp: &str, add_det
         );
         let icon = egui::Rect::from_center_size(egui::pos2(rect.left() + 16.0, rect.center().y), egui::vec2(12.0, 12.0));
         egui::collapsing_header::paint_default_icon(ui, state.openness(ui.ctx()), &details.clone().with_new_rect(icon));
-        file_cell(ui, name_rect, egui::RichText::new(&name).strong());
+        file_cell(ui, name_rect, egui::RichText::new(name).strong());
         file_cell(ui, date_rect, egui::RichText::new(timestamp).small().weak());
         details
             .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -227,10 +267,10 @@ pub fn file_row(ui: &mut egui::Ui, id: u64, name: &str, timestamp: &str, add_det
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use egui_kittest::{Harness, kittest::Queryable};
-    use photocraft_ui_egui::PhotocraftApp;
 
     #[test]
     fn naming_dialog_confirms_once_and_can_be_cancelled() {
@@ -291,7 +331,7 @@ mod tests {
         h.run_steps(20);
         assert!(h.query_by_label("Version history").is_some());
         assert_eq!(*h.state(), 1);
-        h.get_by_label("Details for Poster.pcraft").click();
+        h.get_by_label("Details for Poster").click();
         h.run_steps(20);
         assert!(h.query_by_label("Version history").is_none());
         // Clicking the header also gives it keyboard focus.
@@ -320,7 +360,7 @@ mod tests {
             },
             false,
         );
-        h.get_by_label("Details for Poster.pcraft").click();
+        h.get_by_label("Details for Poster").click();
         h.run_steps(20);
         assert!(h.query_by_label("History of Poster").is_some());
         assert!(h.query_by_label("History of Landscape").is_none());
@@ -332,8 +372,8 @@ mod tests {
 
     #[test]
     fn cloud_views_render_in_all_themes() {
-        let output = std::env::var("PHOTOCRAFT_CLOUD_PREVIEWS").ok();
-        for (index, theme) in ThemeKind::ALL.into_iter().enumerate() {
+        let output = std::env::var("CRAFT_CLOUD_PREVIEWS").ok();
+        for (index, theme) in [egui::Visuals::dark(), egui::Visuals::light()].into_iter().enumerate() {
             for width in [420.0, 760.0] {
                 for view in ["files", "saving"] {
                     let builder = Harness::builder().with_size(egui::vec2(width, 560.0));
@@ -368,10 +408,10 @@ mod tests {
                             notification(ui, "Opened Poster.pcraft · saved 07/10/2026, 01:25:00", false);
                         }
                     });
-                    PhotocraftApp::setup_context(&h.ctx, theme);
+                    h.ctx.set_visuals(theme.clone());
                     h.run_steps(3);
                     if view == "files" {
-                        assert!(h.query_by_label("Details for Poster.pcraft").is_some());
+                        assert!(h.query_by_label("Details for Poster").is_some());
                         assert!(h.query_by_label("Version history (2)").is_none());
                     } else {
                         assert!(h.query_by_label("Save").is_none());
@@ -381,7 +421,7 @@ mod tests {
                         h.render().unwrap().save(format!("{dir}/cloud-{view}-{index}-{width}.png")).unwrap();
                     }
                     if view == "files" {
-                        h.get_by_label("Details for Landscape study.pcraft").click();
+                        h.get_by_label("Details for Landscape study").click();
                         h.run_steps(20);
                         assert!(h.query_by_label("Version history (2)").is_some());
                         if let Some(dir) = &output {
@@ -395,8 +435,8 @@ mod tests {
 
     #[test]
     fn file_names_do_not_duplicate_native_extension() {
-        assert_eq!(file_name(" Poster "), "Poster.pcraft");
-        assert_eq!(file_name("Poster.pcraft"), "Poster.pcraft");
-        assert_eq!(file_name("Poster.PCRAFT"), "Poster.PCRAFT");
+        assert_eq!(crate::AppSpec::PHOTO.file_name(" Poster "), "Poster.pcraft");
+        assert_eq!(crate::AppSpec::PHOTO.file_name("Poster.pcraft"), "Poster.pcraft");
+        assert_eq!(crate::AppSpec::PHOTO.file_name("Poster.PCRAFT"), "Poster.PCRAFT");
     }
 }

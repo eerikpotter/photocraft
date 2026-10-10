@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [features]
-icp-cloud = ["dep:photocraft-cloud-protocol", "dep:sovereign-cloud", "dep:candid"]
+icp-cloud = ["dep:sovereign-cloud-ui"]
 
 [lints]
 workspace = true
@@ -29,9 +29,7 @@ log = { workspace = true }
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-photocraft-cloud-protocol = { path = "../../icp/protocol", optional = true }
-sovereign-cloud = { path = "../../vendor/sovereign-cloud", features = ["browser"], optional = true }
-candid = { version = "0.10", optional = true }
+sovereign-cloud-ui = { path = "../../vendor/sovereign-cloud-ui", optional = true }
 # `wgpu` pulls egui-wgpu's defaults: WebGPU plus the WebGL2 fallback.
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
 rfd = { workspace = true }

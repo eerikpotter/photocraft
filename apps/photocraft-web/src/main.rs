@@ -23,14 +23,6 @@ mod web;
 mod cloud;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-#[path = "cloud/presentation.rs"]
-mod cloud_presentation;
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-#[path = "cloud/flow.rs"]
-mod cloud_flow;
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "cloud/menu.rs"]
 mod cloud_menu;
 
