@@ -31,8 +31,13 @@ PhotoCraft editor, execute filters or use external storage services.
 
 Implementation boundaries:
 
+- `vendor/sovereign-cloud`: checked snapshot of the internal, editor-independent Rust SDK.
+  Its canonical source is `packages/sovereign-cloud` in the parent subnet-cloud integration
+  repo. The SDK handles endpoint/trust configuration, identity adaptation, upload checkpoints,
+  progress and verified downloads. The snapshot keeps this fork independently buildable.
 - `icp/backend`: independent Rust canister workspace; durable state and access checks.
-- `icp/protocol`: versioned Candid data types; independent of the editor document model.
+- `icp/protocol`: compatibility facade for the SDK's unchanged V1 Candid/serde types;
+  independent of the editor document model. Existing method names and stable state are preserved.
 - `apps/photocraft-web/src/cloud`: optional `icp-cloud` platform adapter and cloud panel.
 - `crates/ui-egui/src/service_commands.rs`: provider-neutral host menu requests, empty by
   default. File-menu entries queue requests into the browser adapter; no ICP types or clients
@@ -44,6 +49,13 @@ Cloud operations are browser platform services, like file dialogs and downloads.
 not add identity or networking dependencies to the engine. Document edits still use the
 existing command system. A future agent API needs a deliberate authorization boundary;
 the cloud panel is not an agent interface.
+
+The subnet-cloud local workspace serves this app at `/apps/photocraft/` alongside three
+independent Craft web builds from one frontend canister. Only PhotoCraft enables the SDK
+in this milestone. The editor adapter still owns `.pcraft` export/import, immutable document
+snapshots, document-to-cloud bindings and the existing cloud UI. File transfer and identity
+mechanics live in the SDK. The root's new local network is separate from existing deployments;
+no mainnet origin, account or data migration is performed by this refactor.
 
 **File → Save to Cloud…** asks for a name on the first save and saves a new
 version of an already linked file when the document has changed. **File → Open from Cloud…** opens **My files**.

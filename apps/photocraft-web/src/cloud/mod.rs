@@ -5,10 +5,12 @@ mod panel;
 mod presentation;
 use api::{Api, args};
 use candid::Principal;
-use ic_auth_client::{AuthClient, AuthClientLoginOptions};
 use photocraft_cloud_protocol::*;
 use photocraft_ui_egui::PhotocraftApp;
-use sha2::{Digest, Sha256};
+use sovereign_cloud::{
+    TransferEvent, UploadState,
+    browser::{self, AuthClient},
+};
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -94,7 +96,7 @@ impl Cloud {
         let (slot, sender) = (auth.clone(), tx.clone());
         wasm_bindgen_futures::spawn_local(async move {
             // Never reload on inactivity: that would discard unsaved editor work.
-            match AuthClient::builder().disable_idle(true).build().await {
+            match browser::create_auth_client().await {
                 Ok(client) => {
                     *slot.borrow_mut() = Some(client);
                     send(&sender, &ctx, Event::Initialized);
@@ -187,14 +189,13 @@ impl Cloud {
         if let Some(auth) = auth {
             self.begin_operation("Complete sign-in in the Internet Identity window…");
             self.signing_in = true;
-            auth.login_with_options(
-                AuthClientLoginOptions::builder()
-                    .identity_provider("https://id.ai")
-                    .max_time_to_live(8 * 60 * 60 * 1_000_000_000)
-                    .on_success(move |_| send(&success_tx, &success_ctx, Event::SignedIn))
-                    .on_error(move |e: Option<String>| send(&error_tx, &error_ctx, Event::Error(e.unwrap_or_else(|| "Sign-in cancelled".into()))))
-                    .build(),
-            );
+            if let Err(e) =
+                browser::login(&auth, move || send(&success_tx, &success_ctx, Event::SignedIn), move |e| send(&error_tx, &error_ctx, Event::Error(e)))
+            {
+                self.busy = false;
+                self.signing_in = false;
+                self.notify(e, true);
+            }
         }
     }
     fn save(&mut self, app: &PhotocraftApp, ctx: &egui::Context, copy: bool) {
@@ -281,43 +282,30 @@ impl Cloud {
         self.begin_operation("Connecting to your cloud…");
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         wasm_bindgen_futures::spawn_local(async move {
-            let result: CloudResult<Revision> = async {
-                send(&tx, &ctx, Event::Progress("Preparing cloud storage…".into(), None));
-                if attempt.project.is_none() {
-                    attempt.project = Some(api.update("create_project", args((attempt.name.clone(),))?).await?);
-                    send(&tx, &ctx, Event::Prepared(attempt.clone()));
-                }
-                let project = attempt.project.as_ref().ok_or("Cloud file is unavailable")?;
-                if let Some(id) = attempt.upload {
-                    // A lost commit response is safe to retry. An incomplete upload can resume.
-                    match api.update::<Revision>("commit_upload", args((id,))?).await {
-                        Ok(revision) => return Ok(revision),
-                        Err(e) if e == "Upload incomplete" => {}
-                        Err(e) => return Err(e),
+            let mut state = UploadState {
+                file: attempt.project.clone(),
+                upload: attempt.upload,
+                expected_revision: attempt.expected,
+                name: attempt.name.clone(),
+                request_id: attempt.request.clone(),
+            };
+            let result = api
+                .save(&mut state, attempt.bytes.as_ref(), |event| match event {
+                    TransferEvent::Checkpoint(state) => {
+                        let mut checkpoint = attempt.clone();
+                        checkpoint.project = state.file;
+                        checkpoint.upload = state.upload;
+                        send(&tx, &ctx, Event::Prepared(checkpoint));
                     }
-                } else {
-                    let request = BeginUpload {
-                        project_id: project.id,
-                        expected_revision: attempt.expected,
-                        bytes: attempt.bytes.len() as u64,
-                        sha256: Sha256::digest(attempt.bytes.as_ref()).to_vec(),
-                        request_id: attempt.request.clone(),
-                    };
-                    let upload: Upload = api.update("begin_upload", args((request,))?).await?;
-                    attempt.upload = Some(upload.id);
-                    send(&tx, &ctx, Event::Prepared(attempt.clone()));
-                }
-                let id = attempt.upload.ok_or("Missing upload ID")?;
-                let count = attempt.bytes.len().div_ceil(CHUNK_BYTES);
-                for (index, chunk) in attempt.bytes.chunks(CHUNK_BYTES).enumerate() {
-                    send(&tx, &ctx, Event::Progress("Uploading your file…".into(), Some(index as f32 / count as f32)));
-                    api.update::<()>("put_chunk", args((id, index as u64, chunk.to_vec()))?).await?;
-                    send(&tx, &ctx, Event::Progress("Uploading your file…".into(), Some((index + 1) as f32 / count as f32)));
-                }
-                send(&tx, &ctx, Event::Progress("Finishing save…".into(), None));
-                api.update("commit_upload", args((id,))?).await
-            }
-            .await;
+                    TransferEvent::Uploading { completed, total } => {
+                        send(&tx, &ctx, Event::Progress("Uploading your file…".into(), Some(completed as f32 / total.max(1) as f32)))
+                    }
+                    TransferEvent::Committing => send(&tx, &ctx, Event::Progress("Finishing save…".into(), None)),
+                    _ => {}
+                })
+                .await;
+            attempt.project = state.file;
+            attempt.upload = state.upload;
             send(
                 &tx,
                 &ctx,
@@ -340,27 +328,13 @@ impl Cloud {
         self.begin_operation(format!("Opening {}…", presentation::file_name(&project.name)));
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         wasm_bindgen_futures::spawn_local(async move {
-            let result: CloudResult<(Revision, Vec<u8>)> = async {
-                let revision: Revision = api.update("get_revision", args((project.id, revision.id))?).await?;
-                if revision.bytes > MAX_DOCUMENT_BYTES || revision.chunk_count != revision.bytes.div_ceil(CHUNK_BYTES as u64) {
-                    return Err("Invalid file manifest".into());
-                }
-                let mut bytes = Vec::new();
-                for index in 0..revision.chunk_count {
-                    send(&tx, &ctx, Event::Progress("Downloading your file…".into(), Some(index as f32 / revision.chunk_count as f32)));
-                    let chunk = api.chunk(project.id, revision.id, index).await?;
-                    if chunk.len() > CHUNK_BYTES || bytes.len() as u64 + chunk.len() as u64 > revision.bytes {
-                        return Err("Invalid file chunk".into());
+            let result = api
+                .download(project.id, revision.id, |event| {
+                    if let TransferEvent::Downloading { completed, total } = event {
+                        send(&tx, &ctx, Event::Progress("Downloading your file…".into(), Some(completed as f32 / total.max(1) as f32)));
                     }
-                    bytes.extend(chunk);
-                }
-                if bytes.len() as u64 != revision.bytes || Sha256::digest(&bytes).to_vec() != revision.sha256 {
-                    return Err("File integrity check failed".into());
-                }
-                send(&tx, &ctx, Event::Progress("Opening your file in the editor…".into(), None));
-                Ok((revision, bytes))
-            }
-            .await;
+                })
+                .await;
             send(
                 &tx,
                 &ctx,

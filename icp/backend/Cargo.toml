@@ -19,3 +19,5 @@ sha2 = "0.10"
 
 [dev-dependencies]
 pocket-ic = "16"
+sovereign-cloud = { path = "../../vendor/sovereign-cloud" }
+futures = "0.3"

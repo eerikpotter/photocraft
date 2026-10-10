@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [features]
-icp-cloud = ["dep:photocraft-cloud-protocol", "dep:ic-agent", "dep:ic-auth-client", "dep:candid", "dep:sha2", "dep:hex", "dep:serde", "dep:percent-encoding"]
+icp-cloud = ["dep:photocraft-cloud-protocol", "dep:sovereign-cloud", "dep:candid"]
 
 [lints]
 workspace = true
@@ -30,13 +30,8 @@ egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 photocraft-cloud-protocol = { path = "../../icp/protocol", optional = true }
-ic-agent = { version = "0.45", default-features = false, features = ["wasm-bindgen"], optional = true }
-ic-auth-client = { version = "=0.5.0-beta.0", optional = true }
+sovereign-cloud = { path = "../../vendor/sovereign-cloud", features = ["browser"], optional = true }
 candid = { version = "0.10", optional = true }
-sha2 = { version = "0.10", optional = true }
-hex = { version = "0.4", optional = true }
-serde = { workspace = true, optional = true }
-percent-encoding = { version = "2", optional = true }
 # `wgpu` pulls egui-wgpu's defaults: WebGPU plus the WebGL2 fallback.
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
 rfd = { workspace = true }

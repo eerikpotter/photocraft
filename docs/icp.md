@@ -1,5 +1,11 @@
 # PhotoCraft on ICP
 
+The `codex/subnet-cloud-base` branch extracts the browser cloud transport into the internal
+`sovereign-cloud` SDK while preserving this standalone deployment workflow. When checked out
+under `subnet-cloud/apps/photocraft`, the parent workspace can also serve all four Craft apps
+from one frontend. Its `scripts/dev.py` deploys to a separate local network. The SDK is vendored
+with a hash manifest; update it through the parent `scripts/sync-sdk.py`, not by hand.
+
 The optional cloud build runs the same Rust editor in the browser and adds Internet Identity,
 owner-only cloud files and revision storage. A certified static-site canister serves the
 application; a separate Rust canister stores file manifests and chunked `.pcraft` files.
