@@ -1,6 +1,7 @@
 //! Optional browser/cloud adapter. No changes to the upstream engine or document format.
 mod api;
 mod flow;
+mod menu;
 mod panel;
 mod presentation;
 mod session;
@@ -138,26 +139,12 @@ impl Cloud {
         }
     }
     pub fn install_commands(&self, services: &mut photocraft_ui_egui::Services, ctx: &egui::Context) {
-        for (id, label, after, copy) in [
-            ("host.cloud.save", "Save to Cloud…", "file.saveAs", Some(false)),
-            ("host.cloud.save_copy", "Save a Copy to Cloud…", "host.cloud.save", Some(true)),
-            ("host.cloud.projects", "Open from Cloud…", "host.cloud.save_copy", None),
-        ] {
-            let (tx, ctx) = (self.tx.clone(), ctx.clone());
-            services.commands.push(photocraft_ui_egui::service_commands::Command {
-                id,
-                label,
-                path: &["File"],
-                after,
-                requires_document: copy.is_some(),
-                enabled: true,
-                request: Box::new(move || {
-                    tx.send(copy.map_or(Event::RequestProjects, Event::RequestSave)).map_err(|_| "Cloud service is unavailable".to_string())?;
-                    ctx.request_repaint();
-                    Ok(())
-                }),
-            });
-        }
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        menu::install(services, move |copy| {
+            tx.send(copy.map_or(Event::RequestProjects, Event::RequestSave)).map_err(|_| "Cloud service is unavailable".to_string())?;
+            ctx.request_repaint();
+            Ok(())
+        });
     }
     fn principal(&self) -> Option<Principal> {
         self.auth.borrow().as_ref().filter(|a| a.is_authenticated()).and_then(|a| a.principal().ok())
@@ -221,7 +208,7 @@ impl Cloud {
             return;
         };
         if !copy && self.bindings.get(&doc.doc.id.0).is_some_and(|b| Some(b.owner) != self.principal()) {
-            self.notify("This document belongs to another account. Sign back in, or choose Save a Copy to Cloud.", true);
+            self.notify("This document belongs to another account. Sign back in, or choose Save As to Cloud.", true);
             return;
         }
         let Some(owner) = self.principal() else {
@@ -231,7 +218,7 @@ impl Cloud {
         let binding = self.bindings.get(&doc.doc.id.0).filter(|b| Some(b.owner) == self.principal());
         let project = if copy { None } else { binding.and_then(|b| self.projects.iter().find(|p| p.id == b.file)).cloned() };
         if !copy && binding.is_some() && project.is_none() {
-            self.notify("This cloud file is unavailable. Refresh My files, or choose File → Save a Copy to Cloud.", true);
+            self.notify("This cloud file is unavailable. Refresh My files, or choose File → Save As to Cloud.", true);
             return;
         }
         if flow::route(binding.map(|b| b.document_revision), doc.revision, copy) == flow::SaveRoute::AlreadySaved

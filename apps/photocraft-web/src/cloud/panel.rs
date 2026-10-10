@@ -16,18 +16,14 @@ impl Cloud {
         if self.notice.as_ref().and_then(|n| n.expires).is_some_and(|until| js_sys::Date::now() >= until) {
             self.notice = None;
         }
-        if presentation::launcher(ctx, app.ui.panels.options_bar && !app.ui.view.hides_chrome()) {
-            self.visible = !self.visible;
-            if self.visible {
-                self.view = View::Projects;
-            }
-            if self.visible && !self.busy && self.principal().is_some() {
-                self.refresh(ctx);
-            }
-        }
         let mut visible = self.visible;
         let t = presentation::palette(ctx);
-        egui::Window::new("Sovereign Cloud")
+        let title = match self.view {
+            View::Save if self.copy_mode => "Save As to Cloud",
+            View::Save => "Save to Cloud",
+            View::Projects => "Open from Cloud",
+        };
+        egui::Window::new(title)
             .id(egui::Id::new("photocraft.cloud.library.window")).open(&mut visible)
             .frame(egui::Frame::window(&ctx.global_style()).fill(t.dock).stroke(egui::Stroke::new(1.0, t.accent_border)).corner_radius(t.radius_lg).inner_margin(16.0))
             .default_size([760.0, 560.0]).min_width(420.0).default_pos([400.0, 80.0]).vscroll(true)

@@ -5,28 +5,6 @@ pub fn palette(ctx: &egui::Context) -> Tokens {
     Tokens::for_kind(if Tokens::get(ctx).dark() { ThemeKind::Studio } else { ThemeKind::StudioLight })
 }
 
-/// Follow the editor's measured options bar instead of duplicating its theme-specific heights.
-pub fn launcher(ctx: &egui::Context, options_visible: bool) -> bool {
-    if !options_visible {
-        return false;
-    }
-    let Some(panel) = egui::containers::panel::PanelState::load(ctx, egui::Id::new("options_bar")) else {
-        return false;
-    };
-    let row = panel.outer_rect;
-    egui::Area::new(egui::Id::new("photocraft.cloud.launcher"))
-        .pivot(egui::Align2::RIGHT_CENTER)
-        .fixed_pos(egui::pos2(row.right() - 18.0, row.center().y))
-        .order(egui::Order::Foreground)
-        .show(ctx, |ui| {
-            let logo = egui::Image::new(egui::include_image!("../../assets/icp/logo.svg")).fit_to_exact_size(egui::vec2(28.0, 16.0));
-            ui.add(egui::Button::image_and_text(logo, "Sovereign Cloud").wrap_mode(egui::TextWrapMode::Extend))
-                .on_hover_text("Your cloud files and version history. Also available from the File menu.")
-                .clicked()
-        })
-        .inner
-}
-
 /// Scope the cloud's visual identity to this UI. The editor's theme is untouched.
 pub fn style(ui: &mut egui::Ui) {
     let t = palette(ui.ctx());
@@ -65,16 +43,9 @@ pub fn primary(ui: &mut egui::Ui, label: &str) -> egui::Response {
 }
 
 pub fn header(ui: &mut egui::Ui) {
-    let t = palette(ui.ctx());
-    egui::Frame::new().fill(t.accent_soft).corner_radius(t.radius_lg).inner_margin(16.0).show(ui, |ui| {
-        ui.set_min_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.add(egui::Image::new(egui::include_image!("../../assets/icp/logo.svg")).fit_to_exact_size(egui::vec2(40.0, 24.0)));
-            ui.vertical(|ui| {
-                ui.label(egui::RichText::new("Sovereign Cloud").size(22.0).strong());
-                ui.label(egui::RichText::new("Your files. Your identity.").color(t.accent_text));
-            });
-        });
+    ui.horizontal(|ui| {
+        ui.add(egui::Image::new(egui::include_image!("../../assets/icp/logo.svg")).fit_to_exact_size(egui::vec2(24.0, 14.0)));
+        ui.weak("Sovereign Cloud");
     });
 }
 
@@ -96,8 +67,8 @@ pub fn size_label(bytes: u64) -> String {
 pub fn save_form(ui: &mut egui::Ui, name: &mut String, copy: bool, enabled: bool) -> Option<SaveAction> {
     let mut action = None;
     ui.add_enabled_ui(enabled, |ui| {
-        ui.heading(if copy { "Save a copy to Cloud" } else { "Save to Cloud" });
-        ui.weak(if copy { "Give the new copy a name." } else { "Name this file for your cloud storage." });
+        ui.heading(if copy { "Save As to Cloud" } else { "Save to Cloud" });
+        ui.weak(if copy { "Save under a new name. Future cloud saves will update this new file." } else { "Name this file for your cloud storage." });
         ui.add_space(14.0);
         ui.label("File name");
         ui.add(egui::TextEdit::singleline(name).hint_text("Untitled").desired_width(f32::INFINITY));
@@ -107,7 +78,7 @@ pub fn save_form(ui: &mut egui::Ui, name: &mut String, copy: bool, enabled: bool
         ui.add_space(12.0);
         let valid = !name.trim().is_empty() && name.trim().len() <= 160;
         ui.horizontal(|ui| {
-            if ui.add_enabled_ui(valid, |ui| primary(ui, if copy { "Save copy" } else { "Save" })).inner.clicked() {
+            if ui.add_enabled_ui(valid, |ui| primary(ui, "Save")).inner.clicked() {
                 action = Some(SaveAction::Save);
             }
             if ui.button("Cancel").clicked() {
@@ -262,50 +233,6 @@ mod tests {
     use photocraft_ui_egui::PhotocraftApp;
 
     #[test]
-    fn launcher_tracks_the_toolbar_center_across_themes_and_layout_changes() {
-        let output = std::env::var("PHOTOCRAFT_CLOUD_PREVIEWS").ok();
-        for (index, theme) in ThemeKind::ALL.into_iter().enumerate() {
-            let builder = Harness::builder().with_size(egui::vec2(760.0, 130.0));
-            let builder = if output.is_some() { builder.wgpu() } else { builder };
-            let mut h = builder.build_ui_state(
-                |ui, state: &mut (f32, bool)| {
-                    let t = Tokens::get(ui.ctx());
-                    egui::Panel::top("title_bar").exact_size(if t.pro { 32.0 } else { 38.0 }).show(ui, |ui| {
-                        ui.horizontal_centered(|ui| ui.label("PhotoCraft"));
-                    });
-                    if state.1 {
-                        egui::Panel::top("options_bar").exact_size(state.0).show(ui, |ui| {
-                            ui.horizontal_centered(|ui| {
-                                let _ = ui.button("Toolbar control");
-                            });
-                        });
-                    }
-                    launcher(ui.ctx(), state.1);
-                },
-                (if Tokens::for_kind(theme).pro { 36.0 } else { 42.0 }, true),
-            );
-            PhotocraftApp::setup_context(&h.ctx, theme);
-            h.run_steps(3);
-            let cloud = h.get_by_label("Sovereign Cloud").rect();
-            let neighbor = h.get_by_label("Toolbar control").rect();
-            assert!((cloud.center().y - neighbor.center().y).abs() <= 0.5, "{theme:?}: launcher is not centered with its neighbors");
-            assert!(cloud.height() <= neighbor.height() + 4.0, "{theme:?}: launcher label must stay on one line");
-            if let Some(dir) = &output {
-                h.render().unwrap().save(format!("{dir}/cloud-launcher-{index}.png")).unwrap();
-            }
-            h.state_mut().0 = 56.0;
-            h.run_steps(3);
-            let cloud = h.get_by_label("Sovereign Cloud").rect();
-            let row = egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new("options_bar")).unwrap().outer_rect;
-            assert!((cloud.center().y - row.center().y).abs() <= 0.5);
-            assert!(row.contains_rect(cloud));
-            h.state_mut().1 = false;
-            h.run_steps(3);
-            assert!(h.query_by_label("Sovereign Cloud").is_none());
-        }
-    }
-
-    #[test]
     fn naming_dialog_confirms_once_and_can_be_cancelled() {
         for copy in [false, true] {
             let mut h = Harness::builder().with_size(egui::vec2(460.0, 280.0)).build_ui_state(
@@ -316,7 +243,7 @@ mod tests {
                 },
                 None,
             );
-            h.get_by_label(if copy { "Save copy" } else { "Save" }).click();
+            h.get_by_label("Save").click();
             h.run_steps(3);
             assert_eq!(*h.state(), Some(SaveAction::Save));
             h.get_by_label("Cancel").click();

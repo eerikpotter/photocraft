@@ -751,7 +751,7 @@ pub fn menu_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) -> f32 {
                     if mine.is_empty() {
                         ui.weak(crate::i18n::tr(lang, "(coming soon)"));
                     }
-                    render_level(ui, &mine, 1, &mut clicked, &mut nav);
+                    render_level(ui, &mine, 1, &mut clicked, &mut nav, &app_ref.services.commands);
                 });
                 buttons.push(r.response);
             }
@@ -796,13 +796,27 @@ fn switch_on_hover(ctx: &egui::Context, buttons: &[egui::Response]) {
     }
 }
 
-fn render_level(ui: &mut egui::Ui, items: &[&MenuItem], depth: usize, clicked: &mut Option<String>, nav: &mut crate::menu_nav::Nav) {
+fn render_level(
+    ui: &mut egui::Ui,
+    items: &[&MenuItem],
+    depth: usize,
+    clicked: &mut Option<String>,
+    nav: &mut crate::menu_nav::Nav,
+    commands: &[crate::service_commands::Command],
+) {
     // Menu popups can be taller than the window: each level stays on screen and scrolls (wheel,
     // scroll arrows, keyboard), like a native menu on a small display.
-    crate::menu_nav::level(ui, depth, nav, |ui, nav| render_level_rows(ui, items, depth, clicked, nav));
+    crate::menu_nav::level(ui, depth, nav, |ui, nav| render_level_rows(ui, items, depth, clicked, nav, commands));
 }
 
-fn render_level_rows(ui: &mut egui::Ui, items: &[&MenuItem], depth: usize, clicked: &mut Option<String>, nav: &mut crate::menu_nav::Nav) {
+fn render_level_rows(
+    ui: &mut egui::Ui,
+    items: &[&MenuItem],
+    depth: usize,
+    clicked: &mut Option<String>,
+    nav: &mut crate::menu_nav::Nav,
+    commands: &[crate::service_commands::Command],
+) {
     let t = crate::theme::Tokens::get(ui.ctx());
     let lang = crate::i18n::current();
     // Items never wrap: the menu widens to its longest label plus shortcut (translations can be
@@ -834,7 +848,11 @@ fn render_level_rows(ui: &mut egui::Ui, items: &[&MenuItem], depth: usize, click
             if let Some(c) = it.checked {
                 text = format!("{} {}", if c { "✔" } else { "  " }, text);
             }
-            let mut b = egui::Button::new(text);
+            let mut b = if let Some(icon) = commands.iter().find(|c| c.id == it.id && c.id.starts_with("host.")).and_then(|c| c.icon.clone()) {
+                egui::Button::image_and_text(egui::Image::new(icon).fit_to_exact_size(egui::vec2(18.0, 12.0)), text)
+            } else {
+                egui::Button::new(text)
+            };
             if let Some(tint) = it.color.as_deref().and_then(menu_tint) {
                 b = b.fill(tint.gamma_multiply(0.55));
             }
@@ -862,7 +880,7 @@ fn render_level_rows(ui: &mut egui::Ui, items: &[&MenuItem], depth: usize, click
             let enabled = any_enabled || !child.is_empty();
             ui.add_enabled_ui(enabled, |ui| {
                 nav.row(ui, depth - 1, enabled, None, |ui, nav| {
-                    let r = ui.menu_button(crate::i18n::tr(lang, name), |ui| render_level(ui, &child, depth + 1, clicked, nav));
+                    let r = ui.menu_button(crate::i18n::tr(lang, name), |ui| render_level(ui, &child, depth + 1, clicked, nav, commands));
                     if r.inner.is_some() {
                         // Where the submenu hangs from, to keep it below the menu bar (#319).
                         nav.set_anchor(depth, r.response.rect);

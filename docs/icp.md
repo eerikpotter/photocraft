@@ -76,8 +76,10 @@ ICP_CLI_PLUGIN_COMPUTE_LIMIT_SECS=300 icp sync frontend -e local
 4. Edit and choose **File → Save to Cloud…** again: changes upload directly, without another
    confirmation. Repeating a save at the same document revision reports **already saved**
    without uploading. Use
-   **File → Save a Copy to Cloud…** to name an independent copy. The Sovereign Cloud launcher
-   opens file management; it has no general save button or save tab.
+   **File → Save As to Cloud…** to create a new file; subsequent cloud saves update that new
+   file. Cloud commands appear immediately after their matching local Open, Save and Save As
+   commands, with a small ICP mark. File management opens through Open from Cloud; the toolbar
+   has no separate Sovereign Cloud launcher.
 5. Reload, sign in if necessary, and choose **File → Open from Cloud…**. **My files** lists
    completed saves in compact rows with a name, latest save date/time and **Open file**.
    Click the name/date area to expand version history; **Open file** opens the latest version

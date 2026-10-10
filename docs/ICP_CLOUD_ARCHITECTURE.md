@@ -85,13 +85,16 @@ editor commands. The generic menu extension is kept in its own commit for upstre
 
 The cloud manager has a scoped blue/violet identity and a **My files** library. Saving starts
 only from the File menu. **Save to Cloud…** asks for a name once, then uploads changes directly;
-**Save a Copy to Cloud…** explicitly starts a new naming flow. Once uploading starts, the manager
+**Save As to Cloud…** starts a new naming flow and links the document to the new cloud file.
+Later cloud saves update that new file. Once uploading starts, the manager
 shows progress and files, with no second save button. Repeating Save to Cloud at the same local
 document revision does not create another version. The cloud snapshot revision is tracked
 separately from ordinary local downloads, so a local save cannot suppress a needed cloud save.
-The launcher centers vertically in the editor's measured options bar, following its theme
-and size without modifying upstream toolbar code. Hiding that bar also hides the launcher;
-the File menu remains the entry point when the toolbar is hidden.
+Each cloud command follows its local counterpart: Open from Cloud follows Open, Save to Cloud
+follows Save, and Save As to Cloud follows Save As. A small ICP mark identifies the three
+entries. The shared menu renderer accepts an optional host-provided icon; provider assets
+remain in the web adapter. There is no separate toolbar launcher. The cloud window has a
+compact identity line and uses the current operation as its title.
 
 Each file occupies one bordered row with its name, latest local save date/time and **Open file**.
 Clicking the name/date area expands dated version history; opening a file is a separate action.

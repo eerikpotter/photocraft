@@ -12,6 +12,8 @@ pub struct Command {
     pub after: &'static str,
     pub requires_document: bool,
     pub enabled: bool,
+    /// Optional host-provided mark. The shared editor does not know the storage provider.
+    pub icon: Option<egui::ImageSource<'static>>,
     pub request: Box<dyn Fn() -> Result<(), String>>,
 }
 
@@ -80,6 +82,7 @@ mod tests {
             after: "file.saveAs",
             requires_document: true,
             enabled: true,
+            icon: None,
             request: Box::new(move || {
                 received.set(received.get() + 1);
                 Ok(())

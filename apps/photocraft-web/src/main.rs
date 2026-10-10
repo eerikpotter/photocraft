@@ -30,6 +30,10 @@ mod cloud_presentation;
 #[path = "cloud/flow.rs"]
 mod cloud_flow;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "cloud/menu.rs"]
+mod cloud_menu;
+
 #[cfg(target_arch = "wasm32")]
 fn main() {
     web::start();
