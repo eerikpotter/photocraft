@@ -1,9 +1,9 @@
 //! Run against a separate PocketIC instance; never mutates the interactive demo canisters.
 use candid::{CandidType, Principal, decode_one, encode_args, utils::ArgumentEncoder};
-use photocraft_cloud_protocol::*;
 use pocket_ic::{PocketIc, PocketIcBuilder};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
+use sovereign_cloud::protocol::*;
 
 fn call<T: CandidType + DeserializeOwned>(pic: &PocketIc, canister: Principal, user: Principal, method: &str, args: impl ArgumentEncoder) -> CloudResult<T> {
     let bytes = pic.update_call(canister, user, method, encode_args(args).unwrap()).map_err(|e| format!("{e:?}"))?;

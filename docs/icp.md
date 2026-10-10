@@ -1,10 +1,13 @@
 # PhotoCraft on ICP
 
-The `codex/subnet-cloud-base` branch extracts the browser cloud transport into the internal
-`sovereign-cloud` SDK while preserving this standalone deployment workflow. When checked out
+The `codex/shared-account-files` branch builds on the internal `sovereign-cloud` SDK extraction
+and adds a shared portal account and file catalog while preserving this standalone deployment workflow. When checked out
 under `subnet-cloud/apps/photocraft`, the parent workspace can also serve all four Craft apps
 from one frontend. Its `scripts/dev.py` deploys to a separate local network. The SDK is vendored
 with a hash manifest; update it through the parent `scripts/sync-sdk.py`, not by hand.
+The backend is now a checked snapshot of the parent's `services/sovereign-cloud`, updated
+through `scripts/sync-service.py`. Use the parent deployment to update the subnet.ee workspace;
+the commands below still deploy this standalone PhotoCraft project independently.
 
 The optional cloud build runs the same Rust editor in the browser and adds Internet Identity,
 owner-only cloud files and revision storage. A certified static-site canister serves the
@@ -277,6 +280,16 @@ The earlier delivery proof of concept rendered with WebGPU and forced WebGL2, im
 image, painted and undid a stroke. PNG export reported success in the app, but automation did
 not capture the downloaded file. No dedicated Cloud Engine test has been performed.
 Treat this as an integration milestone; cross-device cloud validation remains outstanding.
+
+Shared-account local validation on 2026-10-10: the root portal and PhotoCraft shared two
+disposable signing identities on a separate test origin. Save, catalog listing, deep-link
+reopen with painted content, and a second revision under the same file ID all passed.
+Account changes cleared cloud lists, preserved open documents and blocked accidental saves
+to a different account. Portal logout propagated without editor reload. Malformed delegation
+storage recovered without panic. Browser error logs were empty. These are real signed local
+canister calls; Internet Identity/passkey issuance and cross-device use were not automated.
+Service tests (6), SDK tests (9), PocketIC persistence/upgrade tests (4), standalone backend
+tests (6), host tests (8), strict changed-package clippy and all 27 layer checks pass.
 
 The cloud UX refinement keeps all user-facing records named **files**. The legacy Candid
 `Project` type and storage schema remain unchanged, preserving existing data and clients.

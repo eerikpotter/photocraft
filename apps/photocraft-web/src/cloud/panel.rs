@@ -4,6 +4,7 @@ use presentation::{RevisionAction, SaveAction};
 
 impl Cloud {
     pub fn ui(&mut self, ctx: &egui::Context, app: &mut PhotocraftApp) {
+        self.check_session(ctx);
         self.poll(app, ctx);
         self.prepare_save(ctx);
         let doc_id = app.session.active().map(|d| d.doc.id.0);
@@ -36,7 +37,8 @@ impl Cloud {
                 ui.add_space(4.0);
                 if let Some(principal) = self.principal() {
                     ui.horizontal(|ui| {
-                        ui.weak("Personal storage on ICP");
+                        ui.weak("subnet.ee · My files");
+                        ui.hyperlink_to("Open in subnet.ee", "/#failid");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_enabled_ui(!self.busy, |ui| {
                                 ui.menu_button("Account", |ui| {
@@ -66,7 +68,8 @@ impl Cloud {
                         if ui.add_enabled_ui((!self.busy || self.signing_in) && self.auth.borrow().is_some(), |ui| presentation::primary(ui, label)).inner.clicked() {
                             self.login(ctx);
                         }
-                        if self.auth.borrow().is_none() { ui.weak("Preparing sign-in…"); ctx.request_repaint(); }
+                        if self.session_loading { ui.weak("Preparing sign-in…"); ctx.request_repaint(); }
+                        else if self.auth.borrow().is_none() && ui.button("Retry sign-in initialization").clicked() { self.reload_session(ctx); }
                         if self.signing_in { ui.small("Allow the sign-in popup, or open this app in your regular browser."); }
                     });
                     if self.busy { ui.add_space(8.0); presentation::transfer(ui, &self.status, self.progress); }
@@ -114,8 +117,11 @@ impl Cloud {
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         self.begin_operation("Signing out…");
         wasm_bindgen_futures::spawn_local(async move {
-            if let Some(a) = auth {
-                a.logout(None).await;
+            if let Some(a) = auth
+                && let Err(e) = a.logout().await
+            {
+                send(&tx, &ctx, Event::Error(e));
+                return;
             }
             send(&tx, &ctx, Event::SignedOut);
         });

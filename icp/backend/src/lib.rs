@@ -1,10 +1,10 @@
-//! PhotoCraft cloud storage. No document engine or external storage dependencies.
+//! Shared accounts and file catalog, preserving the PhotoCraft V1 storage contract.
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 mod store;
 use ic_cdk::api::{msg_caller, time};
 use ic_stable_structures::DefaultMemoryImpl;
-use photocraft_cloud_protocol::*;
+use sovereign_cloud::protocol::*;
 use std::cell::RefCell;
 
 thread_local! { static STORE: RefCell<store::Store<DefaultMemoryImpl>> = RefCell::new(store::Store::new(DefaultMemoryImpl::default())); }
@@ -15,6 +15,19 @@ fn init() {
 #[ic_cdk::post_upgrade]
 fn post_upgrade() {
     STORE.with(|_| {});
+}
+
+#[ic_cdk::update]
+fn get_or_create_account() -> CloudResult<AccountContext> {
+    STORE.with(|s| s.borrow_mut().account(msg_caller(), time()))
+}
+#[ic_cdk::update]
+fn list_files(space: u64, after: Option<u64>, limit: u32) -> CloudResult<FilePage> {
+    STORE.with(|s| s.borrow().files(msg_caller(), space, after, limit))
+}
+#[ic_cdk::update]
+fn get_file(space: u64, file: u64) -> CloudResult<FileDetails> {
+    STORE.with(|s| s.borrow().file(msg_caller(), space, file))
 }
 
 // Metadata is read using updates: manifests and ownership come from consensus.

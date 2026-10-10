@@ -3,13 +3,14 @@ mod api;
 mod flow;
 mod panel;
 mod presentation;
+mod session;
 use api::{Api, args};
 use candid::Principal;
 use photocraft_cloud_protocol::*;
 use photocraft_ui_egui::PhotocraftApp;
 use sovereign_cloud::{
     TransferEvent, UploadState,
-    browser::{self, AuthClient},
+    browser::{self, BrowserSession},
 };
 use std::{
     cell::RefCell,
@@ -20,6 +21,7 @@ use std::{
 
 #[derive(Clone)]
 struct Attempt {
+    owner: Principal,
     project: Option<Project>,
     upload: Option<u64>,
     expected: Option<u64>,
@@ -32,12 +34,13 @@ struct Attempt {
 enum Event {
     RequestSave(bool),
     RequestProjects,
-    Initialized,
+    SessionLoaded(CloudResult<BrowserSession>),
+    Scoped(String, Box<Event>),
     SignedIn,
     SignedOut,
     Error(String),
     Progress(String, Option<f32>),
-    Projects(Vec<Project>),
+    Projects(AccountContext, Vec<Project>),
     Prepared(Attempt),
     Saved(Attempt, Revision),
     Opened(Project, Revision, Vec<u8>),
@@ -65,7 +68,7 @@ struct Notice {
     expires: Option<f64>,
 }
 pub struct Cloud {
-    auth: Rc<RefCell<Option<AuthClient>>>,
+    auth: Rc<RefCell<Option<BrowserSession>>>,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
     visible: bool,
@@ -83,6 +86,14 @@ pub struct Cloud {
     bindings: BTreeMap<u64, Binding>,
     attempt: Option<Attempt>,
     delete: Option<(u64, String)>,
+    session_loading: bool,
+    session_owner: Option<Principal>,
+    next_session_check: f64,
+    account: Option<AccountContext>,
+    launch: Option<sovereign_cloud::launch::CloudLaunch>,
+}
+fn send_scoped(tx: &mpsc::Sender<Event>, ctx: &egui::Context, stamp: &str, event: Event) {
+    send(tx, ctx, Event::Scoped(stamp.to_string(), Box::new(event)));
 }
 fn send(tx: &mpsc::Sender<Event>, ctx: &egui::Context, event: Event) {
     let _ = tx.send(event);
@@ -93,28 +104,24 @@ impl Cloud {
     pub fn new(ctx: egui::Context) -> Self {
         let (tx, rx) = mpsc::channel();
         let auth = Rc::new(RefCell::new(None));
-        let (slot, sender) = (auth.clone(), tx.clone());
+        let sender = tx.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            // Never reload on inactivity: that would discard unsaved editor work.
-            match browser::create_auth_client().await {
-                Ok(client) => {
-                    *slot.borrow_mut() = Some(client);
-                    send(&sender, &ctx, Event::Initialized);
-                }
-                Err(e) => send(&sender, &ctx, Event::Error(format!("Identity initialization: {e}"))),
-            }
+            send(&sender, &ctx, Event::SessionLoaded(BrowserSession::load().await));
         });
+        let query = web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default();
+        let launch = sovereign_cloud::launch::CloudLaunch::parse(&query);
+        let launch_error = launch.as_ref().err().cloned();
         Self {
             auth,
             tx,
             rx,
-            visible: false,
+            visible: launch_error.is_some() || launch.as_ref().is_ok_and(|v| v.is_some()),
             view: View::Projects,
             busy: false,
             signing_in: false,
             status: String::new(),
             progress: None,
-            notice: None,
+            notice: launch_error.map(|message| Notice { message, error: true, expires: None }),
             pending_save: None,
             copy_mode: false,
             named_doc: None,
@@ -123,6 +130,11 @@ impl Cloud {
             bindings: BTreeMap::new(),
             attempt: None,
             delete: None,
+            session_loading: true,
+            session_owner: None,
+            next_session_check: 0.0,
+            account: None,
+            launch: launch.ok().flatten(),
         }
     }
     pub fn install_commands(&self, services: &mut photocraft_ui_egui::Services, ctx: &egui::Context) {
@@ -171,13 +183,15 @@ impl Cloud {
             }
         };
         self.begin_operation("Loading your files…");
+        let stamp = self.auth.borrow().as_ref().map(|s| s.stamp().to_string()).unwrap_or_default();
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         wasm_bindgen_futures::spawn_local(async move {
-            send(
+            send_scoped(
                 &tx,
                 &ctx,
-                match api.projects().await {
-                    Ok(p) => Event::Projects(p),
+                &stamp,
+                match async { Ok::<_, String>((api.account().await?, api.projects().await?)) }.await {
+                    Ok((account, p)) => Event::Projects(account, p),
                     Err(e) => Event::Error(e),
                 },
             );
@@ -206,6 +220,14 @@ impl Cloud {
             self.notify("Open or create a document first", true);
             return;
         };
+        if !copy && self.bindings.get(&doc.doc.id.0).is_some_and(|b| Some(b.owner) != self.principal()) {
+            self.notify("This document belongs to another account. Sign back in, or choose Save a Copy to Cloud.", true);
+            return;
+        }
+        let Some(owner) = self.principal() else {
+            self.notify("Sign in before saving", true);
+            return;
+        };
         let binding = self.bindings.get(&doc.doc.id.0).filter(|b| Some(b.owner) == self.principal());
         let project = if copy { None } else { binding.and_then(|b| self.projects.iter().find(|p| p.id == b.file)).cloned() };
         if !copy && binding.is_some() && project.is_none() {
@@ -225,6 +247,7 @@ impl Cloud {
             return;
         }
         let attempt = Attempt {
+            owner,
             project,
             upload: None,
             expected: if copy { None } else { binding.map(|b| b.version) },
@@ -271,6 +294,11 @@ impl Cloud {
         }
     }
     fn run_save(&mut self, mut attempt: Attempt, ctx: &egui::Context) {
+        if Some(attempt.owner) != self.principal() {
+            self.busy = false;
+            self.notify("Account changed. The captured file was not sent.", true);
+            return;
+        }
         let api = match self.api() {
             Ok(a) => a,
             Err(e) => {
@@ -280,6 +308,7 @@ impl Cloud {
             }
         };
         self.begin_operation("Connecting to your cloud…");
+        let stamp = self.auth.borrow().as_ref().map(|s| s.stamp().to_string()).unwrap_or_default();
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         wasm_bindgen_futures::spawn_local(async move {
             let mut state = UploadState {
@@ -295,20 +324,21 @@ impl Cloud {
                         let mut checkpoint = attempt.clone();
                         checkpoint.project = state.file;
                         checkpoint.upload = state.upload;
-                        send(&tx, &ctx, Event::Prepared(checkpoint));
+                        send_scoped(&tx, &ctx, &stamp, Event::Prepared(checkpoint));
                     }
                     TransferEvent::Uploading { completed, total } => {
-                        send(&tx, &ctx, Event::Progress("Uploading your file…".into(), Some(completed as f32 / total.max(1) as f32)))
+                        send_scoped(&tx, &ctx, &stamp, Event::Progress("Uploading your file…".into(), Some(completed as f32 / total.max(1) as f32)))
                     }
-                    TransferEvent::Committing => send(&tx, &ctx, Event::Progress("Finishing save…".into(), None)),
+                    TransferEvent::Committing => send_scoped(&tx, &ctx, &stamp, Event::Progress("Finishing save…".into(), None)),
                     _ => {}
                 })
                 .await;
             attempt.project = state.file;
             attempt.upload = state.upload;
-            send(
+            send_scoped(
                 &tx,
                 &ctx,
+                &stamp,
                 match result {
                     Ok(r) => Event::Saved(attempt, r),
                     Err(e) => Event::Error(e),
@@ -326,18 +356,20 @@ impl Cloud {
             }
         };
         self.begin_operation(format!("Opening {}…", presentation::file_name(&project.name)));
+        let stamp = self.auth.borrow().as_ref().map(|s| s.stamp().to_string()).unwrap_or_default();
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         wasm_bindgen_futures::spawn_local(async move {
             let result = api
                 .download(project.id, revision.id, |event| {
                     if let TransferEvent::Downloading { completed, total } = event {
-                        send(&tx, &ctx, Event::Progress("Downloading your file…".into(), Some(completed as f32 / total.max(1) as f32)));
+                        send_scoped(&tx, &ctx, &stamp, Event::Progress("Downloading your file…".into(), Some(completed as f32 / total.max(1) as f32)));
                     }
                 })
                 .await;
-            send(
+            send_scoped(
                 &tx,
                 &ctx,
+                &stamp,
                 match result {
                     Ok((r, bytes)) => Event::Opened(project, r, bytes),
                     Err(e) => Event::Error(e),
@@ -357,6 +389,7 @@ impl Cloud {
         let empty_file = self.projects.iter().find(|p| p.pending_upload == Some(id) && p.revisions.is_empty()).map(|p| p.id);
         let file = if method == "delete_project" { Some(id) } else { empty_file };
         self.begin_operation("Removing cloud data…");
+        let stamp = self.auth.borrow().as_ref().map(|s| s.stamp().to_string()).unwrap_or_default();
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         wasm_bindgen_futures::spawn_local(async move {
             let result: CloudResult<()> = async {
@@ -369,9 +402,10 @@ impl Cloud {
                 Ok(())
             }
             .await;
-            send(
+            send_scoped(
                 &tx,
                 &ctx,
+                &stamp,
                 match result {
                     Ok(()) => Event::Removed { file, item: id },
                     Err(e) => Event::Error(e),
@@ -381,12 +415,21 @@ impl Cloud {
     }
     fn poll(&mut self, app: &mut PhotocraftApp, ctx: &egui::Context) {
         while let Ok(event) = self.rx.try_recv() {
+            let event = match event {
+                Event::Scoped(stamp, event) => {
+                    if !self.auth.borrow().as_ref().is_some_and(|s| s.stamp() == stamp && s.is_authenticated()) {
+                        continue;
+                    }
+                    *event
+                }
+                event => event,
+            };
             match event {
                 Event::RequestSave(copy) => {
                     self.visible = true;
                     if !self.busy && self.attempt.is_none() {
                         self.copy_mode = copy;
-                        let binding = app.session.active().and_then(|d| self.bindings.get(&d.doc.id.0)).filter(|b| Some(b.owner) == self.principal());
+                        let binding = app.session.active().and_then(|d| self.bindings.get(&d.doc.id.0));
                         if binding.is_some() && !copy {
                             self.save(app, ctx, false);
                         } else if let Some(doc) = app.session.active() {
@@ -404,23 +447,28 @@ impl Cloud {
                         self.refresh(ctx);
                     }
                 }
-                Event::Initialized | Event::SignedIn => {
-                    self.busy = false;
-                    self.signing_in = false;
-                    self.notice = None;
-                    if self.principal().is_some() {
-                        self.refresh(ctx);
+                Event::SessionLoaded(result) => {
+                    self.session_loading = false;
+                    match result {
+                        Ok(session) if session.is_current() => {
+                            self.session_owner = session.principal().ok();
+                            *self.auth.borrow_mut() = Some(session);
+                            self.busy = false;
+                            self.signing_in = false;
+                            if self.principal().is_some() {
+                                self.refresh(ctx);
+                            }
+                        }
+                        Ok(_) => self.reload_session(ctx),
+                        Err(e) => self.notify(format!("Identity initialization: {e}"), true),
                     }
                 }
+                Event::SignedIn => self.reload_session(ctx),
                 Event::SignedOut => {
-                    self.busy = false;
-                    self.signing_in = false;
-                    self.projects.clear();
-                    self.bindings.clear();
-                    self.attempt = None;
-                    self.copy_mode = false;
+                    self.reload_session(ctx);
                     self.notify("Signed out. Your open files stay in the editor.", false);
                 }
+                Event::Scoped(_, _) => {}
                 Event::Error(e) => {
                     self.busy = false;
                     self.signing_in = false;
@@ -430,12 +478,15 @@ impl Cloud {
                     self.status = s;
                     self.progress = fraction;
                 }
-                Event::Projects(p) => {
+                Event::Projects(account, p) => {
+                    self.account = Some(account);
                     self.projects = p;
                     self.busy = false;
+                    self.open_launch(ctx);
                 }
                 Event::Prepared(a) => self.attempt = Some(a),
                 Event::Saved(a, r) => {
+                    browser::notify_files_changed();
                     self.busy = false;
                     self.view = View::Projects;
                     self.attempt = None;
@@ -468,6 +519,7 @@ impl Cloud {
                     }
                 }
                 Event::Removed { file, item } => {
+                    browser::notify_files_changed();
                     self.busy = false;
                     if self.attempt.as_ref().is_some_and(|a| a.upload == Some(item) || (file.is_some() && a.project.as_ref().map(|p| p.id) == file)) {
                         self.attempt = None;

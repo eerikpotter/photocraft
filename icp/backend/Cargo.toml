@@ -9,7 +9,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-photocraft-cloud-protocol = { path = "../protocol" }
+sovereign-cloud = { path = "../../vendor/sovereign-cloud" }
 ic-cdk = "0.20.3"
 ic-stable-structures = "0.7"
 candid = "0.10"
@@ -19,5 +19,4 @@ sha2 = "0.10"
 
 [dev-dependencies]
 pocket-ic = "16"
-sovereign-cloud = { path = "../../vendor/sovereign-cloud" }
 futures = "0.3"

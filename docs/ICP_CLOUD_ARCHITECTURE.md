@@ -35,7 +35,9 @@ Implementation boundaries:
   Its canonical source is `packages/sovereign-cloud` in the parent subnet-cloud integration
   repo. The SDK handles endpoint/trust configuration, identity adaptation, upload checkpoints,
   progress and verified downloads. The snapshot keeps this fork independently buildable.
-- `icp/backend`: independent Rust canister workspace; durable state and access checks.
+- `icp/backend`: independently buildable snapshot of the root workspace's
+  `services/sovereign-cloud`; durable state and access checks. Update through the parent's
+  `scripts/sync-service.py`, which checks the source and Candid hash manifest.
 - `icp/protocol`: compatibility facade for the SDK's unchanged V1 Candid/serde types;
   independent of the editor document model. Existing method names and stable state are preserved.
 - `apps/photocraft-web/src/cloud`: optional `icp-cloud` platform adapter and cloud panel.
@@ -56,6 +58,23 @@ in this milestone. The editor adapter still owns `.pcraft` export/import, immuta
 snapshots, document-to-cloud bindings and the existing cloud UI. File transfer and identity
 mechanics live in the SDK. The root's new local network is separate from existing deployments;
 no mainnet origin, account or data migration is performed by this refactor.
+
+The shared-account milestone adds the root portal's sign-in and **Minu failid** catalog.
+Both hosts use the same SDK `BrowserSession` and persisted Rust AuthClient adapter on one
+trusted origin. Every SDK call rejects changed or expired sessions, and stale asynchronous
+results are discarded. Account changes never reload the editor or discard its documents.
+Document bindings retain their owner, so changing accounts requires an explicit copy before
+saving the old account's document elsewhere. Logout prevents further client calls but cannot
+revoke an already issued IC delegation or cancel a call already submitted to consensus.
+
+The service adds `get_or_create_account`, `list_files` and `get_file`, with accounts and the
+file index in new stable-memory IDs 6 and 7. Existing schemas and IDs 0–5 remain unchanged.
+Legacy files are indexed once at first account resolution without moving their contents.
+The portal opens PhotoCraft with a logical service/space/file reference; the backend checks
+ownership again and the adapter checks the format before verified download. Saving the
+opened document keeps its file ID. V1 files are all tagged `photocraft.pcraft` version 1;
+other formats require a future typed creation API. Accounts currently bind one principal to
+one personal space; shared spaces and alternate identity linking are not implemented.
 
 **File → Save to Cloud…** asks for a name on the first save and saves a new
 version of an already linked file when the document has changed. **File → Open from Cloud…** opens **My files**.
