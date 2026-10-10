@@ -76,25 +76,25 @@ opened document keeps its file ID. V1 files are all tagged `photocraft.pcraft` v
 other formats require a future typed creation API. Accounts currently bind one principal to
 one personal space; shared spaces and alternate identity linking are not implemented.
 
-**File → Save to Cloud…** asks for a name on the first save and saves a new
-version of an already linked file when the document has changed. **File → Open from Cloud…** opens **My files**.
+**File → Sovereign Cloud → Save** asks for a name on the first save and saves a new
+version of an already linked file when the document has changed. **File → Sovereign Cloud → Open…** opens **My files**.
 The separate Sovereign Cloud window owns sign-in, file management and dated version history;
 ordinary File Save/Export stays local. Host requests are visible in menu inspection and
 explicitly reject automation until a capability model exists. They never replace built-in
 editor commands. The generic menu extension is kept in its own commit for upstream review.
 
 The cloud manager has a scoped blue/violet identity and a **My files** library. Saving starts
-only from the File menu. **Save to Cloud…** asks for a name once, then uploads changes directly;
-**Save As to Cloud…** starts a new naming flow and links the document to the new cloud file.
+only from the File menu. **Sovereign Cloud → Save** asks for a name once, then uploads changes directly;
+**Sovereign Cloud → Save As…** starts a new naming flow and links the document to the new cloud file.
 Later cloud saves update that new file. Once uploading starts, the manager
-shows progress and files, with no second save button. Repeating Save to Cloud at the same local
+shows progress and files, with no second save button. Repeating cloud Save at the same local
 document revision does not create another version. The cloud snapshot revision is tracked
 separately from ordinary local downloads, so a local save cannot suppress a needed cloud save.
-Each cloud command follows its local counterpart: Open from Cloud follows Open, Save to Cloud
-follows Save, and Save As to Cloud follows Save As. A small ICP mark identifies the three
-entries. The shared menu renderer accepts an optional host-provided icon; provider assets
-remain in the web adapter. There is no separate toolbar launcher. The cloud window has a
-compact identity line and uses the current operation as its title.
+A single **Sovereign Cloud** section follows the local save block in the File menu. Its
+heading carries the ICP mark once, followed by **Save**, **Save As…** and **Open…**. The
+heading is not interactive and takes no keyboard-navigation slot. The shared menu renderer
+accepts optional host-provided sections; provider names and assets remain in the web adapter.
+There is no separate toolbar launcher. The cloud window has a compact identity line and uses the current operation as its title.
 
 Each file occupies one bordered row with its name, latest local save date/time and **Open file**.
 Clicking the name/date area expands dated version history; opening a file is a separate action.

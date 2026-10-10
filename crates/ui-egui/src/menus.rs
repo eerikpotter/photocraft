@@ -835,7 +835,30 @@ fn render_level_rows(
     // of its first child.
     let mut shown_subs: Vec<&str> = Vec::new();
     let mut last_was_sep = true;
+    let mut last_section = None;
     for (i, it) in items.iter().enumerate() {
+        let section = commands.iter().find(|c| c.id == it.id && c.id.starts_with("host.")).and_then(|c| c.section.as_ref());
+        let section = section.filter(|_| it.path.len() == depth && it.label != "---");
+        if section.map(|s| s.id) != last_section {
+            if (last_section.is_some() || section.is_some()) && !last_was_sep && it.label != "---" {
+                ui.separator();
+                last_was_sep = true;
+            }
+            if let Some(section) = section {
+                ui.push_id(section.id, |ui| {
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(ui.spacing().button_padding.x);
+                        if let Some(icon) = &section.icon {
+                            ui.add(egui::Image::new(icon.clone()).fit_to_exact_size(egui::vec2(18.0, 12.0)));
+                        }
+                        ui.label(egui::RichText::new(section.title).small().strong().color(t.text_dim));
+                    });
+                    ui.add_space(3.0);
+                });
+            }
+            last_section = section.map(|s| s.id);
+        }
         if it.path.len() == depth {
             if it.label == "---" {
                 if !last_was_sep && i + 1 < items.len() {
@@ -848,11 +871,7 @@ fn render_level_rows(
             if let Some(c) = it.checked {
                 text = format!("{} {}", if c { "✔" } else { "  " }, text);
             }
-            let mut b = if let Some(icon) = commands.iter().find(|c| c.id == it.id && c.id.starts_with("host.")).and_then(|c| c.icon.clone()) {
-                egui::Button::image_and_text(egui::Image::new(icon).fit_to_exact_size(egui::vec2(18.0, 12.0)), text)
-            } else {
-                egui::Button::new(text)
-            };
+            let mut b = egui::Button::new(text);
             if let Some(tint) = it.color.as_deref().and_then(menu_tint) {
                 b = b.fill(tint.gamma_multiply(0.55));
             }

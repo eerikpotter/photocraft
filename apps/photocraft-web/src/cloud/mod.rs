@@ -208,7 +208,7 @@ impl Cloud {
             return;
         };
         if !copy && self.bindings.get(&doc.doc.id.0).is_some_and(|b| Some(b.owner) != self.principal()) {
-            self.notify("This document belongs to another account. Sign back in, or choose Save As to Cloud.", true);
+            self.notify("This document belongs to another account. Sign back in, or choose File → Sovereign Cloud → Save As.", true);
             return;
         }
         let Some(owner) = self.principal() else {
@@ -218,7 +218,7 @@ impl Cloud {
         let binding = self.bindings.get(&doc.doc.id.0).filter(|b| Some(b.owner) == self.principal());
         let project = if copy { None } else { binding.and_then(|b| self.projects.iter().find(|p| p.id == b.file)).cloned() };
         if !copy && binding.is_some() && project.is_none() {
-            self.notify("This cloud file is unavailable. Refresh My files, or choose File → Save As to Cloud.", true);
+            self.notify("This cloud file is unavailable. Refresh My files, or choose File → Sovereign Cloud → Save As.", true);
             return;
         }
         if flow::route(binding.map(|b| b.document_revision), doc.revision, copy) == flow::SaveRoute::AlreadySaved

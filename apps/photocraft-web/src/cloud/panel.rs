@@ -79,7 +79,7 @@ impl Cloud {
                 ui.add_space(12.0);
                 ui.collapsing("How cloud saving works", |ui| {
                     ui.label("Editing runs on your device. ICP hosts the app and your saved files.");
-                    ui.label("File → Save to Cloud saves here. File → Save / Export downloads a local copy. Save before closing or reloading; cloud saving is manual.");
+                    ui.label("File → Sovereign Cloud → Save saves here. File → Save / Export downloads a local copy. Save before closing or reloading; cloud saving is manual.");
                     ui.label("Demo limits: 64 MiB per file; 256 MiB per account including versions; 20 files, 20 versions each; 2 GiB across the service.");
                     ui.label("Files are access-controlled, not end-to-end encrypted. The service controller can upgrade the backend.");
                     ui.hyperlink_to("Source and architecture", "https://github.com/eerikpotter/photocraft/blob/codex/icp-local-hosting/docs/ICP_CLOUD_ARCHITECTURE.md");
@@ -135,7 +135,7 @@ impl Cloud {
             }
         } else {
             ui.heading("No document is open");
-            ui.label("Create or open a document in PhotoCraft, then choose File → Save to Cloud.");
+            ui.label("Create or open a document in PhotoCraft, then choose File → Sovereign Cloud → Save.");
         }
     }
 
@@ -175,7 +175,7 @@ impl Cloud {
         files.sort_by_key(|p| std::cmp::Reverse(p.revisions.last().map_or(p.created_at, |r| r.created_at)));
         if !files.iter().any(|p| !p.revisions.is_empty()) && !self.busy {
             ui.label("Your saved files will appear here.");
-            ui.weak("Use File → Save to Cloud in the editor to save your first file.");
+            ui.weak("Use File → Sovereign Cloud → Save in the editor to save your first file.");
         }
         if files.iter().any(|p| !p.revisions.is_empty()) {
             presentation::file_column_labels(ui);

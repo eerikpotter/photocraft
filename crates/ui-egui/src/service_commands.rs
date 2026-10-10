@@ -2,6 +2,14 @@
 use crate::{PhotocraftApp, menus::MenuItem};
 use serde_json::{Value, json};
 
+/// A non-interactive heading shared by consecutive host commands in the same menu.
+#[derive(Clone)]
+pub struct Section {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub icon: Option<egui::ImageSource<'static>>,
+}
+
 /// An interactive host request, not an engine editing operation. IDs use the `host.` namespace
 /// so a provider cannot replace an existing editor command. The callback queues work; it must
 /// not report an asynchronous operation as completed. Hosts register nothing by default.
@@ -12,8 +20,8 @@ pub struct Command {
     pub after: &'static str,
     pub requires_document: bool,
     pub enabled: bool,
-    /// Optional host-provided mark. The shared editor does not know the storage provider.
-    pub icon: Option<egui::ImageSource<'static>>,
+    /// Optional host-provided grouping. The shared editor does not know the storage provider.
+    pub section: Option<Section>,
     pub request: Box<dyn Fn() -> Result<(), String>>,
 }
 
@@ -82,7 +90,7 @@ mod tests {
             after: "file.saveAs",
             requires_document: true,
             enabled: true,
-            icon: None,
+            section: None,
             request: Box::new(move || {
                 received.set(received.get() + 1);
                 Ok(())

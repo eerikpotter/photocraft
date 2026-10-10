@@ -69,18 +69,18 @@ ICP_CLI_PLUGIN_COMPUTE_LIMIT_SECS=300 icp sync frontend -e local
 ### Browser demonstration
 
 1. Open/create a document using the normal editor.
-2. Choose **File → Save to Cloud…**. Sign in with Internet Identity if needed.
+2. Choose **File → Sovereign Cloud → Save**. Sign in with Internet Identity if needed.
 3. The first save asks for a file name. Select **Save** once; the naming dialog is replaced by
    the file manager and progress. The loader appears before encoding, followed by upload
    progress and **Finishing save…**. Wait for the dated **Saved** activity confirmation.
-4. Edit and choose **File → Save to Cloud…** again: changes upload directly, without another
+4. Edit and choose **File → Sovereign Cloud → Save** again: changes upload directly, without another
    confirmation. Repeating a save at the same document revision reports **already saved**
    without uploading. Use
-   **File → Save As to Cloud…** to create a new file; subsequent cloud saves update that new
-   file. Cloud commands appear immediately after their matching local Open, Save and Save As
-   commands, with a small ICP mark. File management opens through Open from Cloud; the toolbar
-   has no separate Sovereign Cloud launcher.
-5. Reload, sign in if necessary, and choose **File → Open from Cloud…**. **My files** lists
+   **File → Sovereign Cloud → Save As…** to create a new file; subsequent cloud saves update that new
+   file. The File menu has one **Sovereign Cloud** section below the local save block, with
+   one ICP mark in its heading and **Save**, **Save As…**, **Open…** below. File management
+   opens through the section’s Open action; there is no separate toolbar launcher.
+5. Reload, sign in if necessary, and choose **File → Sovereign Cloud → Open…**. **My files** lists
    completed saves in compact rows with a name, latest save date/time and **Open file**.
    Click the name/date area to expand version history; **Open file** opens the latest version
    directly. The resizable cloud window scrolls when needed, without a second nested file list.
@@ -147,7 +147,7 @@ Commit the generated public ID mappings under `.icp/data/`; never commit identit
 local `.icp/cache/`. Keep the application origin stable; a new canister/custom domain may
 change the user's app-specific principal unless II alternative origins are configured.
 Local test files do not migrate to mainnet automatically. Download a local `.pcraft` copy,
-open it in the mainnet app, and use **File → Save to Cloud…** to save it there.
+open it in the mainnet app, and use **File → Sovereign Cloud → Save** to save it there.
 
 The service initially permits signed-in users to create owner-only files within the
 published quotas. The global 2 GiB document cap bounds this demo but can be exhausted by
