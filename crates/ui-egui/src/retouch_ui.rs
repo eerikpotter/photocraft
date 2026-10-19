@@ -29,6 +29,7 @@ pub(crate) fn clone_params(app: &PhotocraftApp) -> Option<Value> {
     let o = &app.ui.tool_options;
     let mut p = json!({"aligned": o.clone_aligned, "sampleLayer": o.clone_sample});
     if app.ui.tool == Tool::CloneStamp {
+        p["wrap"] = json!(app.ui.view.pattern_preview);
         p["opacity"] = json!(app.session.tools.brush.opacity * 100.0);
         p["flow"] = json!(app.session.tools.brush.flow * 100.0);
     }
@@ -165,18 +166,34 @@ fn remove_params(o: &crate::state::ToolOptions) -> Value {
     json!({"sampleAllLayers": o.sample_all_layers, "newLayer": o.remove_new_layer})
 }
 
+/// The selection a queued Remove stroke was drawn against. A later selection must not
+/// redirect the queued strokes to a different layer or colour component.
+#[derive(Clone, PartialEq)]
+pub(crate) struct RemoveTarget {
+    doc: photocraft_doc::DocId,
+    layer: Option<photocraft_doc::LayerId>,
+    channel: photocraft_engine::channel_cmds::ChannelTarget,
+    paint: Value,
+}
+
+fn remove_target(app: &PhotocraftApp) -> Option<RemoveTarget> {
+    let st = app.session.active()?;
+    Some(RemoveTarget { doc: st.doc.id, layer: st.active_layer, channel: st.channel_view.target, paint: crate::canvas::paint_target(app) })
+}
+
 /// Remove after each stroke off: a finished stroke waits with the others, tinted on the canvas,
 /// until ↩ or the options bar's ✓ applies them all as one removal (Esc or ⊘ drops them).
 pub fn remove_pending_add(app: &mut PhotocraftApp, points: &[[f64; 3]]) {
+    let Some(target) = remove_target(app) else { return };
     let Some(st) = app.session.active() else { return };
-    let (doc, size) = (st.doc.id, [st.doc.size.width, st.doc.size.height]);
-    if app.remove_pending_doc != Some(doc) {
+    let size = [st.doc.size.width, st.doc.size.height];
+    if app.remove_pending_target.as_ref() != Some(&target) {
         app.remove_pending.clear();
         app.remove_trail = None;
-        app.remove_pending_doc = Some(doc);
+        app.remove_pending_target = Some(target);
     }
     let diameter = app.session.tools.brush.size;
-    app.remove_trail.get_or_insert_with(|| crate::stroke_trail::Trail::new(size)).feed(points, diameter);
+    app.remove_trail.get_or_insert_with(|| crate::stroke_trail::Trail::new(size)).feed_stroke(points, diameter);
     app.remove_pending.push(points.to_vec());
     app.ui.status = crate::i18n::fmt(tl!("Strokes to remove: {n} (Enter applies, Esc cancels)"), &[("n", &app.remove_pending.len().to_string())]);
     app.ui.status_error = false;
@@ -184,12 +201,13 @@ pub fn remove_pending_add(app: &mut PhotocraftApp, points: &[[f64; 3]]) {
 
 /// Apply the waiting strokes as one removal (one job, one undo step). False when none wait.
 pub fn remove_pending_commit(app: &mut PhotocraftApp) -> bool {
-    if app.remove_pending.is_empty() {
+    // Enter can arrive before the next canvas frame checks pending-stroke lifetime.
+    if !remove_pending_live(app) {
         return false;
     }
     let strokes = std::mem::take(&mut app.remove_pending);
     app.remove_trail = None;
-    app.remove_pending_doc = None;
+    app.remove_pending_target = None;
     let mut p = remove_params(&app.ui.tool_options);
     p["strokes"] = json!(strokes);
     p["target"] = crate::canvas::paint_target(app);
@@ -208,7 +226,7 @@ pub fn remove_pending_cancel(app: &mut PhotocraftApp) -> bool {
     }
     app.remove_pending.clear();
     app.remove_trail = None;
-    app.remove_pending_doc = None;
+    app.remove_pending_target = None;
     app.ui.status.clear();
     app.ui.status_error = false;
     true
@@ -220,8 +238,7 @@ pub fn remove_pending_live(app: &mut PhotocraftApp) -> bool {
     if app.remove_pending.is_empty() {
         return false;
     }
-    let doc = app.session.active().map(|st| st.doc.id);
-    if app.ui.tool == Tool::Remove && doc.is_some() && app.remove_pending_doc == doc {
+    if app.ui.tool == Tool::Remove && remove_target(app).as_ref() == app.remove_pending_target.as_ref() {
         return true;
     }
     remove_pending_cancel(app);
@@ -342,13 +359,28 @@ pub fn content_aware_move_params(app: &PhotocraftApp, offset: [i64; 2]) -> Value
 }
 
 /// Object Selection: the dragged rectangle. A click (or a sub-2 px nudge) cannot be a
-/// rectangle: like Photoshop's click-to-select, it falls back to a Quick Selection dab at
+/// rectangle: with Object Finder on it selects the object under the pointer, the one hovering
+/// highlighted (#4087; ⇧ adds, ⌥ subtracts, ⇧⌥ intersects, otherwise replaces). With it off it
+/// falls back to a Quick Selection dab at
 /// the brush size instead of looking dead (⌥ subtracts, otherwise it adds). Larger drags
 /// run the rectangle GrabCut (⌥ subtracts, ⇧ adds, otherwise replaces).
 pub fn finish_object_selection(app: &mut PhotocraftApp, start: [f64; 2], end: [f64; 2], mods: egui::Modifiers) {
     let (x, y) = (start[0].min(end[0]), start[1].min(end[1]));
     let (w, h) = ((end[0] - start[0]).abs(), (end[1] - start[1]).abs());
     let sample_all = app.ui.tool_options.sample_all_layers;
+    if (w < 2.0 || h < 2.0) && app.ui.tool_options.object_finder {
+        // Object Finder (#4087): the object under the click, as hovering highlighted it.
+        let mode = match (mods.shift, mods.alt) {
+            (true, true) => "intersect",
+            (true, false) => "add",
+            (false, true) => "subtract",
+            (false, false) => "replace",
+        };
+        let r = app.run("select.object", json!({"point": [end[0], end[1]], "mode": mode, "sampleAllLayers": sample_all}));
+        crate::object_finder::clear(app);
+        report_smart_result(app, r, tl!("No object found there — drag a rectangle around it"));
+        return;
+    }
     if w < 2.0 || h < 2.0 {
         let size = app.session.tools.brush.size;
         let mode = if mods.alt { "subtract" } else { "add" };
@@ -600,6 +632,7 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
             }
         }
         Tool::ObjectSelection => {
+            crate::widgets::checkbox(ui, &mut o.object_finder, tl!("Object Finder"));
             crate::widgets::checkbox(ui, &mut o.sample_all_layers, tl!("Sample All Layers"));
             opt(ui, tl!("Drag a rectangle around the object"));
             crate::widgets::vline(ui, 22.0);
@@ -674,6 +707,30 @@ mod tests {
     fn stripes(app: &mut PhotocraftApp, step: usize, target: &str) {
         for x in (0..100).step_by(step) {
             app.run("paint.pencil", json!({"points": [[x, 0], [x, 60]], "size": 2, "color": "#606060", "target": target})).unwrap();
+        }
+    }
+
+    #[test]
+    fn clone_stamp_in_pattern_preview_wraps_a_dab_across_the_right_edge() {
+        for pattern_preview in [false, true] {
+            let mut app = app();
+            app.run("paint.pencil", json!({"points": [[10, 10]], "size": 24, "color": "#ff0000"})).unwrap();
+            app.ui.tool = Tool::CloneStamp;
+            app.ui.clone_source = Some([10.0, 10.0]);
+            app.ui.view.pattern_preview = pattern_preview;
+            let modifiers = egui::Modifiers::NONE;
+            tool_event(&mut app, ToolEvent::Down { x: 98.0, y: 30.0, pressure: 1.0 }, modifiers);
+            tool_event(&mut app, ToolEvent::Up { x: 98.0, y: 30.0 }, modifiers);
+            assert!(!app.ui.status_error, "{}", app.ui.status);
+            let surface = active(&app).surface().unwrap();
+            let center = surface.rgba(98, 30);
+            assert!(center[0] > 0.9 && center[1] < 0.1, "clone center: {center:?}");
+            let opposite = surface.rgba(1, 30);
+            if pattern_preview {
+                assert!(opposite[0] > 0.9 && opposite[1] < 0.1, "Pattern Preview must wrap the clone footprint: {opposite:?}");
+            } else {
+                assert!(opposite[0] > 0.9 && opposite[1] > 0.9, "ordinary cloning must not wrap: {opposite:?}");
+            }
         }
     }
 
@@ -776,6 +833,7 @@ mod tests {
         // A click cannot be a rectangle: it selects at the cursor instead of looking dead.
         let mut app = app();
         app.ui.tool = Tool::ObjectSelection;
+        app.ui.tool_options.object_finder = false;
         let m = egui::Modifiers::NONE;
         tool_event(&mut app, ToolEvent::Down { x: 50.0, y: 30.0, pressure: 1.0 }, m);
         tool_event(&mut app, ToolEvent::Up { x: 50.0, y: 30.0 }, m);
@@ -1097,6 +1155,95 @@ mod tests {
         let px = active(&app).surface().unwrap().rgba(30, 30);
         assert!(px.iter().zip(bg).all(|(a, b)| (a - b).abs() < 0.02), "{px:?} vs {bg:?}");
         assert!(!remove_pending_commit(&mut app), "nothing left to apply");
+    }
+
+    #[test]
+    fn every_waiting_remove_stroke_is_tinted_in_full() {
+        // #6555: each stroke used to be stamped only past the previous stroke's point count.
+        let mut app = app();
+        app.ui.tool = Tool::Remove;
+        app.ui.tool_options.remove_after_each_stroke = false;
+        let strokes: [&[[f64; 3]]; 3] = [
+            &[[10.0, 10.0, 1.0], [40.0, 10.0, 1.0], [70.0, 10.0, 1.0]],
+            &[[10.0, 30.0, 1.0], [40.0, 30.0, 1.0]],
+            &[[10.0, 50.0, 1.0], [20.0, 50.0, 1.0], [30.0, 50.0, 1.0], [50.0, 50.0, 1.0], [90.0, 50.0, 1.0]],
+        ];
+        for s in strokes {
+            remove_pending_add(&mut app, s);
+        }
+        assert_eq!(app.remove_pending.len(), 3);
+        let t = app.remove_trail.as_ref().expect("the waiting strokes are tinted");
+        let k = f64::from(t.scale());
+        for s in strokes {
+            for w in s.windows(2) {
+                for i in 0..=8 {
+                    let f = f64::from(i) / 8.0;
+                    let (x, y) = (w[0][0] + (w[1][0] - w[0][0]) * f, w[0][1] + (w[1][1] - w[0][1]) * f);
+                    assert_eq!(t.coverage((x / k) as usize, (y / k) as usize), 255, "({x}, {y}) on a waiting stroke is tinted");
+                }
+            }
+        }
+        // Enter, Esc, another tool and another document all drop the tint with the strokes.
+        assert!(remove_pending_commit(&mut app));
+        assert!(app.remove_trail.is_none());
+        remove_pending_add(&mut app, strokes[0]);
+        assert!(remove_pending_cancel(&mut app) && app.remove_trail.is_none());
+        remove_pending_add(&mut app, strokes[1]);
+        app.ui.tool = Tool::SpotHealing;
+        assert!(!remove_pending_live(&mut app) && app.remove_trail.is_none());
+        app.ui.tool = Tool::Remove;
+        remove_pending_add(&mut app, strokes[2]);
+        app.run("file.new", json!({"width": 100, "height": 60})).unwrap();
+        assert!(!remove_pending_live(&mut app) && app.remove_trail.is_none());
+    }
+
+    #[test]
+    fn queued_remove_cannot_commit_after_layer_or_channel_target_changes() {
+        for change in ["layer", "color", "mask"] {
+            let mut app = app();
+            app.run("layer.new.layer", json!({"name": "Original"})).unwrap();
+            if change == "color" {
+                app.run("channel.target", json!({"channel": "red"})).unwrap();
+            }
+            app.ui.tool = Tool::Remove;
+            app.ui.tool_options.remove_after_each_stroke = false;
+            remove_pending_add(&mut app, &[[12.0, 10.0, 1.0], [16.0, 12.0, 1.0]]);
+            assert_eq!(app.remove_pending.len(), 1);
+            assert!(remove_pending_live(&mut app));
+
+            match change {
+                "layer" => {
+                    app.run("layer.new.layer", json!({"name": "Other"})).unwrap();
+                }
+                "color" => {
+                    app.run("channel.target", json!({"channel": "blue"})).unwrap();
+                }
+                _ => {
+                    app.run("layer.layerMask.revealAll", json!({})).unwrap();
+                    app.ui.mask_target = true;
+                }
+            }
+
+            let journal = app.session.journal.len();
+            assert!(!remove_pending_commit(&mut app), "{change}: Enter must not retarget a queued stroke");
+            assert_eq!(app.session.journal.len(), journal, "{change}: no Remove command ran");
+            assert!(app.remove_pending.is_empty() && app.remove_trail.is_none(), "{change}: queue cleared");
+            assert!(app.remove_pending_target.is_none());
+        }
+    }
+
+    #[test]
+    fn queued_remove_starts_a_new_queue_after_target_switch() {
+        let mut app = app();
+        app.run("layer.new.layer", json!({"name": "Original"})).unwrap();
+        app.ui.tool = Tool::Remove;
+        app.ui.tool_options.remove_after_each_stroke = false;
+        remove_pending_add(&mut app, &[[12.0, 10.0, 1.0], [16.0, 12.0, 1.0]]);
+        app.run("layer.new.layer", json!({"name": "Other"})).unwrap();
+        remove_pending_add(&mut app, &[[40.0, 10.0, 1.0], [44.0, 12.0, 1.0]]);
+        assert_eq!(app.remove_pending.len(), 1, "strokes from different layers must not be combined");
+        assert_eq!(app.remove_pending[0][0][0], 40.0);
+        assert!(remove_pending_live(&mut app));
     }
 
     #[test]
