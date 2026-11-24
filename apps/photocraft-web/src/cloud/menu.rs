@@ -28,7 +28,7 @@ pub fn install(services: &mut photocraft_ui_egui::Services, request: impl Fn(Opt
 mod tests {
     use super::*;
     use egui_kittest::{Harness, kittest::Queryable};
-    use photocraft_ui_egui::{PhotocraftApp, menus, theme::ThemeKind};
+    use photocraft_ui_egui::{PhotocraftApp, menus};
     use std::{cell::RefCell, rc::Rc};
 
     #[test]
@@ -41,51 +41,47 @@ mod tests {
             Ok(())
         });
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), services);
-        let items = menus::menu_items(&app);
+        // Exercise the browser's in-window menu even when the test runs on macOS.
+        craft::ui::testing::windows::set_os(app.ctx(), craft::host::target::Os::Linux);
+        let items = menus::menu_rows(&app);
         for (id, parent, enabled) in [
             ("host.cloud.save", "file.revert", false),
             ("host.cloud.save_copy", "host.cloud.save", false),
             ("host.cloud.projects", "host.cloud.save_copy", true),
         ] {
-            let at = items.iter().position(|item| item.id == id).unwrap();
-            assert_eq!(items[at - 1].id, parent);
+            let at = items.iter().position(|item| item.command.id == id).unwrap();
+            assert_eq!(items[at - 1].command.id, parent);
             assert_eq!(items[at].enabled, enabled);
         }
         app.run("file.new", Default::default()).unwrap();
-        let mut h = Harness::builder().with_size(egui::vec2(760.0, 900.0)).build_ui_state(
-            |ui, app| {
-                menus::menu_bar(app, ui);
-            },
-            app,
-        );
-        PhotocraftApp::setup_context(&h.ctx, ThemeKind::Pro);
+        let mut h = Harness::builder().with_context(app.ctx().clone()).with_size(egui::vec2(1280.0, 900.0)).with_max_steps(64).build_eframe(move |_| app);
+        h.run_steps(3);
         for label in ["Save", "Save As…", "Open…"] {
             h.get_by_label("File").click();
             h.run_steps(3);
-            assert_eq!(h.query_all_by_label("Sovereign Cloud").count(), 1);
-            let heading = h.get_by_label("Sovereign Cloud").rect();
-            h.get_all_by_label(label).find(|row| row.rect().top() > heading.bottom()).unwrap().click();
+            h.get_by_label("Sovereign Cloud").click();
+            h.run_steps(3);
+            // The parent File menu also has local Save/Open items; the last
+            // matching node belongs to the newly opened cloud submenu.
+            h.query_all_by_label(label).last().unwrap().click();
             h.run_steps(3);
         }
         assert_eq!(*calls.borrow(), vec![Some(false), Some(true), None]);
 
-        // The section heading must not take a keyboard-navigation slot. From the
-        // last enabled local save row, Down/Enter activates the first cloud action.
+        // The upstream submenu owns keyboard navigation and queues exactly one action.
         h.get_by_label("File").click();
         h.run_steps(3);
-        let heading = h.get_by_label("Sovereign Cloud").rect();
-        let local_copy = h.get_by_label_contains("Save a Copy…").rect();
-        assert!(local_copy.bottom() < heading.top());
-        h.hover_at(local_copy.center());
+        let submenu = h.get_by_label("Sovereign Cloud").rect();
+        h.hover_at(submenu.center());
         h.run_steps(3);
-        h.key_press(egui::Key::ArrowDown);
+        h.key_press(egui::Key::ArrowRight);
         h.run_steps(3);
         h.key_press(egui::Key::Enter);
         h.run_steps(3);
         assert_eq!(*calls.borrow(), vec![Some(false), Some(true), None, Some(false)]);
 
         // Hiding the first action must keep exactly one heading on the remaining block.
-        h.state_mut().run("edit.menus", r#"{"hide":["host.cloud.save"]}"#.parse().unwrap()).unwrap();
+        h.state_mut().session.edit_prefs(|p| p.menus.hidden.push("host.cloud.save".into()));
         h.get_by_label("File").click();
         h.run_steps(3);
         assert_eq!(h.query_all_by_label("Sovereign Cloud").count(), 1);
